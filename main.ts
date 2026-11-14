@@ -64,6 +64,15 @@ async function waitForDone(): Promise<void> {
   }
 }
 
+/**
+ * Stop the server promptly once the env says done. The env may still hold keep-alive
+ * connections open; close() alone would wait for them to idle out, so drop them explicitly.
+ */
+function shutdown(server: ReturnType<typeof createApp>): void {
+  server.close();
+  server.closeAllConnections();
+}
+
 async function main(): Promise<void> {
   const server = createApp();
   await new Promise<void>((resolve, reject) => {
@@ -78,10 +87,7 @@ async function main(): Promise<void> {
   await register(address.port);
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
   await waitForDone();
-  // The env may still hold keep-alive connections open; close() alone would wait for them to idle
-  // out, so drop them explicitly and let the process exit promptly.
-  server.close();
-  server.closeAllConnections();
+  shutdown(server);
   process.stdout.write('[entry] done\n');
 }
 

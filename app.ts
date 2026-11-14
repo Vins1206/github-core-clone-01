@@ -3,7 +3,11 @@
 // process and one in-memory store, using only the Node standard library.
 //
 // Layout: this file is the whole server. main.ts owns the harness lifecycle (bind an ephemeral
-// port, register it, wait for done); everything the suite scores lives here.
+// port, register it, wait for done); everything the suite scores lives here. Sections, in order:
+// the shared in-memory store and git object model, the packfile/pkt-line codec, fetch planning,
+// the REST v3 router, git smart HTTP (upload-pack v2/v0, receive-pack v0), a GraphQL v4 parser
+// and executor, and the MCP endpoint. All four surfaces read and write the one store, and every
+// timestamp comes from a logical clock, so a replayed request sequence is byte-for-byte stable.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createHash } from 'node:crypto';
