@@ -1,25 +1,40 @@
-// A standalone GitHub-compatible git forge: git smart HTTP (upload-pack protocol v2 and v0,
-// receive-pack v0), the REST v3 API, the GraphQL v4 API and an MCP endpoint, all served from one
-// process and one in-memory store, using only the Node standard library.
+// forge — a small, self-contained GitHub-compatible forge.
 //
-// Layout: this file is the whole server. main.ts owns the harness lifecycle (bind an ephemeral
-// port, register it, wait for done); everything the suite scores lives here. Sections, in order:
-// the shared in-memory store and git object model, the packfile/pkt-line codec, fetch planning,
-// the REST v3 router, git smart HTTP (upload-pack v2/v0, receive-pack v0), a GraphQL v4 parser
-// and executor, and the MCP endpoint. All four surfaces read and write the one store, and every
-// timestamp comes from a logical clock, so a replayed request sequence is byte-for-byte stable.
+// One in-memory store backs four surfaces that all observe the same state:
+//   * git smart HTTP (protocol v2 with a v0 fallback)
+//   * the REST v3 API
+//   * a GraphQL endpoint covering the query/mutation shapes clients use
+//   * an MCP endpoint (JSON-RPC, modern discover + legacy initialize)
+//
+// Everything runs on the Node.js standard library alone: git objects are
+// plain SHA-1 addressed blobs/commits/trees/tags kept in Maps, packfiles
+// are produced and consumed with node:zlib, and the HTTP layer is
+// node:http. There is no database and no subprocess: state lives for the
+// lifetime of the process, which is exactly what the embedding harness
+// expects from createApp().
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
+import { createServer } from 'node:http';
+import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 
 // ---------------------------------------------------------------------------
-// small helpers
+// Identity of the single authenticated user (the "viewer").
+// ---------------------------------------------------------------------------
 
-const JSON_TYPE = 'application/json; charset=utf-8';
+export const VIEWER_LOGIN = 'adaiversen';
+export const VIEWER_ID = 1000;
+const VIEWER_NAME = 'ada iversen';
+const VIEWER_EMAIL = 'adaiversen@example.invalid';
+
 const ZERO_OID = '0000000000000000000000000000000000000000';
-const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
-const FALLBACK_LOGIN = 'adaiversen';
+const EPOCH_SECONDS = 1735689600; // 2025-01-01T00:00:00Z, base for fake clocks
+const AGENT_STRING = 'forge/1.0';
+const FORGE_VERSION = '1.0.0';
+
+// ---------------------------------------------------------------------------
+// Small byte helpers.
+// ---------------------------------------------------------------------------
 
 function sha1Hex(data: Buffer): string {
   return createHash('sha1').update(data).digest('hex');
@@ -29,177 +44,444 @@ function isOid(value: string): boolean {
   return /^[0-9a-f]{40}$/.test(value);
 }
 
-/** A logical clock: timestamps the forge writes are derived from a counter, never the wall clock. */
-const clockState = { now: 1767225600 };
-function nextTimestamp(): number {
-  clockState.now += 61;
-  return clockState.now;
+function utf8(text: string): Buffer {
+  return Buffer.from(text, 'utf8');
 }
-function isoOf(epochSec: number): string {
-  return new Date(epochSec * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+
+function countLines(data: Buffer): number {
+  if (data.length === 0) return 0;
+  const text = data.toString('utf8');
+  const parts = text.split('\n').length;
+  return text.endsWith('\n') ? parts - 1 : parts;
 }
 
 // ---------------------------------------------------------------------------
-// the store
+// pkt-line framing (git smart HTTP).
+// ---------------------------------------------------------------------------
 
-type GitObjectType = 'commit' | 'tree' | 'blob' | 'tag';
+function pktLine(payload: Buffer | string): Buffer {
+  const body = typeof payload === 'string' ? utf8(payload) : payload;
+  const head = utf8((body.length + 4).toString(16).padStart(4, '0'));
+  return Buffer.concat([head, body]);
+}
 
-interface StoredObject {
-  type: GitObjectType;
+const PKT_FLUSH = utf8('0000');
+const PKT_DELIM = utf8('0001');
+
+type PktItem = Buffer | 'flush' | 'delim';
+
+// Parse a whole pkt-line stream. Throws on malformed input so HTTP handlers
+// can answer 400 instead of dying.
+function parsePktStream(buf: Buffer): { items: PktItem[]; rest: Buffer } {
+  const items: PktItem[] = [];
+  let offset = 0;
+  while (offset + 4 <= buf.length) {
+    const hex = buf.subarray(offset, offset + 4).toString('ascii');
+    if (!/^[0-9a-fA-F]{4}$/.test(hex)) throw new Error('invalid pkt-line header');
+    const length = parseInt(hex, 16);
+    if (length === 0 || length === 2) {
+      items.push('flush');
+      offset += 4;
+    } else if (length === 1) {
+      items.push('delim');
+      offset += 4;
+    } else {
+      if (length < 4 || offset + length > buf.length) throw new Error('truncated pkt-line');
+      items.push(Buffer.from(buf.subarray(offset + 4, offset + length)));
+      offset += length;
+    }
+  }
+  if (offset !== buf.length) throw new Error('trailing bytes after pkt-line stream');
+  return { items, rest: buf.subarray(offset) };
+}
+
+// Split pkt-items into flush/delim separated sections.
+function pktSections(items: PktItem[]): Buffer[][] {
+  const sections: Buffer[][] = [];
+  let current: Buffer[] = [];
+  for (const item of items) {
+    if (item === 'flush' || item === 'delim') {
+      sections.push(current);
+      current = [];
+    } else {
+      current.push(item);
+    }
+  }
+  if (current.length > 0) sections.push(current);
+  return sections;
+}
+
+// Wrap payload bytes in side-band-64k band-1 packets.
+function sidebandPackets(data: Buffer, band = 1): Buffer[] {
+  const packets: Buffer[] = [];
+  const maxPayload = 65520 - 5;
+  for (let offset = 0; offset < data.length; offset += maxPayload) {
+    const chunk = data.subarray(offset, Math.min(data.length, offset + maxPayload));
+    packets.push(pktLine(Buffer.concat([Buffer.from([band]), chunk])));
+  }
+  return packets;
+}
+
+// ---------------------------------------------------------------------------
+// Git object model.
+// ---------------------------------------------------------------------------
+
+type ObjType = 'commit' | 'tree' | 'blob' | 'tag';
+
+interface GitObject {
+  type: ObjType;
   data: Buffer;
 }
 
-/** Every git object the forge holds, across all repositories, keyed by its sha1 id. */
-const objectStore = new Map<string, StoredObject>();
+const TYPE_TO_CODE: Record<ObjType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
+const CODE_TO_TYPE: Record<number, ObjType> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
 
-function storeObject(type: GitObjectType, data: Buffer): string {
-  const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  const oid = sha1Hex(Buffer.concat([header, data]));
-  if (!objectStore.has(oid)) objectStore.set(oid, { type, data });
-  return oid;
+function objectId(type: ObjType, data: Buffer): string {
+  const header = utf8(`${type} ${data.length}\0`);
+  return sha1Hex(Buffer.concat([header, data]));
 }
 
-function getObject(oid: string): StoredObject | undefined {
-  return objectStore.get(oid);
+// --- packfiles --------------------------------------------------------------
+
+function encodePackObjectHeader(type: ObjType, size: number): Buffer {
+  const bytes: number[] = [];
+  let first = (TYPE_TO_CODE[type] << 4) | (size & 0x0f);
+  size = Math.floor(size / 16);
+  if (size > 0) first |= 0x80;
+  bytes.push(first);
+  while (size > 0) {
+    let byte = size & 0x7f;
+    size = Math.floor(size / 128);
+    if (size > 0) byte |= 0x80;
+    bytes.push(byte);
+  }
+  return Buffer.from(bytes);
 }
+
+function buildPack(objects: GitObject[]): Buffer {
+  const parts: Buffer[] = [];
+  const header = Buffer.alloc(12);
+  header.write('PACK', 0, 'ascii');
+  header.writeUInt32BE(2, 4);
+  header.writeUInt32BE(objects.length, 8);
+  parts.push(header);
+  for (const object of objects) {
+    parts.push(encodePackObjectHeader(object.type, object.data.length));
+    parts.push(deflateSync(object.data));
+  }
+  const body = Buffer.concat(parts);
+  const trailer = createHash('sha1').update(body).digest();
+  return Buffer.concat([body, trailer]);
+}
+
+// Apply a git delta buffer to a base payload.
+function applyDelta(base: Buffer, delta: Buffer): Buffer {
+  let offset = 0;
+  const readVarint = (): number => {
+    let value = 0;
+    let shift = 0;
+    for (;;) {
+      if (offset >= delta.length) throw new Error('delta varint overruns buffer');
+      const byte = delta[offset++];
+      value |= (byte & 0x7f) * 2 ** shift;
+      shift += 7;
+      if ((byte & 0x80) === 0) break;
+    }
+    return value;
+  };
+  const sourceSize = readVarint();
+  if (sourceSize !== base.length) throw new Error('delta base size mismatch');
+  const targetSize = readVarint();
+  const chunks: Buffer[] = [];
+  let produced = 0;
+  while (offset < delta.length) {
+    const command = delta[offset++];
+    if (command & 0x80) {
+      let copyOffset = 0;
+      let copySize = 0;
+      for (let bit = 0; bit < 4; bit++) {
+        if (command & (1 << bit)) copyOffset |= delta[offset++] * 2 ** (8 * bit);
+      }
+      for (let bit = 0; bit < 3; bit++) {
+        if (command & (0x10 << bit)) copySize |= delta[offset++] * 2 ** (8 * bit);
+      }
+      if (copySize === 0) copySize = 0x10000;
+      chunks.push(base.subarray(copyOffset, copyOffset + copySize));
+      produced += copySize;
+    } else if (command > 0) {
+      chunks.push(delta.subarray(offset, offset + command));
+      offset += command;
+      produced += command;
+    } else {
+      throw new Error('delta opcode 0 is reserved');
+    }
+  }
+  const result = Buffer.concat(chunks);
+  if (produced !== targetSize || result.length !== targetSize) {
+    throw new Error('delta result size mismatch');
+  }
+  return result;
+}
+
+interface PackEntry {
+  type: ObjType;
+  data: Buffer;
+}
+
+// Parse a packfile. Delta bases may live inside the pack (ofs/ref) or, for
+// thin packs, in the receiving repository — `externalBase` resolves those.
+function readPack(
+  buf: Buffer,
+  externalBase?: (oid: string) => GitObject | undefined,
+): PackEntry[] {
+  if (buf.length < 12 + 20) throw new Error('pack too short');
+  if (buf.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('bad pack magic');
+  const version = buf.readUInt32BE(4);
+  if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
+  const count = buf.readUInt32BE(8);
+  const trailerStart = buf.length - 20;
+  const trailer = buf.subarray(trailerStart);
+  const digest = createHash('sha1').update(buf.subarray(0, trailerStart)).digest();
+  if (!digest.equals(trailer)) throw new Error('pack checksum mismatch');
+
+  interface RawEntry {
+    type: ObjType;
+    data: Buffer;
+    packOffset: number;
+    baseOffset?: number;
+    baseOid?: string;
+  }
+  const raw: RawEntry[] = [];
+  const byOffset = new Map<number, number>();
+  let offset = 12;
+  for (let index = 0; index < count; index++) {
+    const entryOffset = offset;
+    let byte = buf[offset++];
+    const type = CODE_TO_TYPE[(byte >> 4) & 0x07];
+    if (!type) throw new Error('unknown pack object type');
+    let size = byte & 0x0f;
+    let shift = 4;
+    while (byte & 0x80) {
+      byte = buf[offset++];
+      size |= (byte & 0x7f) * 2 ** shift;
+      shift += 7;
+    }
+    let baseOffset: number | undefined;
+    let baseOid: string | undefined;
+    let kind: ObjType | 'ofs-delta' | 'ref-delta' = type;
+    const code = (buf[entryOffset] >> 4) & 0x07;
+    if (code === 6) {
+      kind = 'ofs-delta';
+      let back = buf[offset++];
+      let value = back & 0x7f;
+      while (back & 0x80) {
+        back = buf[offset++];
+        value = (value + 1) * 128 + (back & 0x7f);
+      }
+      baseOffset = entryOffset - value;
+    } else if (code === 7) {
+      kind = 'ref-delta';
+      baseOid = buf.subarray(offset, offset + 20).toString('hex');
+      offset += 20;
+    }
+    const inflated = inflateSync(buf.subarray(offset, trailerStart), { info: true });
+    const data = inflated.buffer as Buffer;
+    if (data.length !== size) throw new Error('pack object size mismatch');
+    offset += (inflated.engine as unknown as { bytesWritten: number }).bytesWritten;
+    byOffset.set(entryOffset, raw.length);
+    raw.push({
+      type: kind === 'ofs-delta' || kind === 'ref-delta' ? 'blob' : type,
+      data,
+      packOffset: entryOffset,
+      baseOffset,
+      baseOid,
+    });
+    // Remember the delta flavour on the entry for the resolution pass.
+    (raw[raw.length - 1] as RawEntry & { kind: string }).kind = kind;
+  }
+  if (offset !== trailerStart) throw new Error('pack entries do not end at the trailer');
+
+  const resolved: (PackEntry | undefined)[] = raw.map(() => undefined);
+  const resolve = (index: number, depth: number): PackEntry => {
+    const cached = resolved[index];
+    if (cached) return cached;
+    if (depth > 64) throw new Error('delta chain too deep');
+    const entry = raw[index] as RawEntry & { kind: string };
+    let out: PackEntry;
+    if (entry.kind === 'ofs-delta') {
+      const baseIndex = byOffset.get(entry.baseOffset as number);
+      if (baseIndex === undefined) throw new Error('ofs-delta base not in pack');
+      const base = resolve(baseIndex, depth + 1);
+      out = { type: base.type, data: applyDelta(base.data, entry.data) };
+    } else if (entry.kind === 'ref-delta') {
+      let base: PackEntry | undefined;
+      const baseOid = entry.baseOid as string;
+      for (let i = 0; i < raw.length; i++) {
+        const candidate = raw[i] as RawEntry & { kind: string };
+        if (candidate.kind !== 'ofs-delta' && candidate.kind !== 'ref-delta') {
+          if (objectId(candidate.type, candidate.data) === baseOid) {
+            base = resolve(i, depth + 1);
+            break;
+          }
+        }
+      }
+      if (!base && externalBase) {
+        const external = externalBase(baseOid);
+        if (external) base = { type: external.type, data: external.data };
+      }
+      if (!base) throw new Error('ref-delta base not found');
+      out = { type: base.type, data: applyDelta(base.data, entry.data) };
+    } else {
+      out = { type: entry.type, data: entry.data };
+    }
+    resolved[index] = out;
+    return out;
+  };
+  return raw.map((_, index) => resolve(index, 0));
+}
+
+// ---------------------------------------------------------------------------
+// Repository store.
+// ---------------------------------------------------------------------------
 
 interface CommentRec {
-  dbId: number;
+  id: number;
   body: string;
-  seq: number;
+  author: string;
+  createdSeq: number;
 }
 
 interface IssueRec {
-  dbId: number;
+  id: number;
   number: number;
   title: string;
   body: string;
   state: 'open' | 'closed';
   labels: string[];
   comments: CommentRec[];
-  seq: number;
+  createdSeq: number;
 }
 
 interface PullRec {
-  dbId: number;
+  id: number;
   number: number;
   title: string;
   body: string;
   state: 'open' | 'closed';
+  merged: boolean;
+  mergedAt: string | null;
+  mergeCommitSha: string | null;
   headRef: string;
   baseRef: string;
-  merged: boolean;
-  mergeCommitSha: string | null;
-  seq: number;
+  headShaAtCreate: string;
+  baseShaAtCreate: string;
+  createdSeq: number;
 }
 
 interface LabelRec {
   name: string;
   color: string;
-  description: string | null;
 }
 
 interface RepoRec {
-  dbId: number;
+  id: number;
+  owner: string;
   name: string;
-  description: string | null;
+  description: string;
   isPrivate: boolean;
   defaultBranch: string;
+  headRef: string;
+  objects: Map<string, GitObject>;
   refs: Map<string, string>;
   labels: Map<string, LabelRec>;
   issues: Map<number, IssueRec>;
   pulls: Map<number, PullRec>;
   nextNumber: number;
-  seq: number;
+  createdSeq: number;
 }
 
-const state = {
-  login: null as string | null,
-  repos: new Map<string, RepoRec>(),
-  repoSeq: 0,
-  dbSeq: 5000,
-  reqSeq: 0,
-};
-
-function viewerLogin(): string {
-  return state.login ?? FALLBACK_LOGIN;
+interface Store {
+  repos: Map<string, RepoRec>;
+  nextRepoId: number;
+  nextIssueId: number;
+  nextPullId: number;
+  nextCommentId: number;
+  clockSeq: number;
+  requestSeq: number;
 }
 
-/** The first owner segment the suite addresses becomes the token owner's login. */
-function learnLogin(owner: string): void {
-  if (state.login === null && owner !== '') state.login = owner;
+function createStore(): Store {
+  return {
+    repos: new Map(),
+    nextRepoId: 1,
+    nextIssueId: 1,
+    nextPullId: 1,
+    nextCommentId: 1,
+    clockSeq: 0,
+    requestSeq: 0,
+  };
 }
 
-function createRepo(name: string, description: string | null, isPrivate: boolean): RepoRec {
-  state.repoSeq += 1;
-  state.dbSeq += 1;
+// Deterministic pseudo-clock: each call advances one second past the epoch.
+function tickIso(store: Store): string {
+  store.clockSeq += 1;
+  return new Date((EPOCH_SECONDS + store.clockSeq) * 1000).toISOString();
+}
+
+function tickSeconds(store: Store): number {
+  store.clockSeq += 1;
+  return EPOCH_SECONDS + store.clockSeq;
+}
+
+function repoKey(owner: string, name: string): string {
+  return `${owner}/${name}`;
+}
+
+function findRepo(store: Store, owner: string, name: string): RepoRec | undefined {
+  return store.repos.get(repoKey(owner, name));
+}
+
+function createRepoRec(
+  store: Store,
+  owner: string,
+  name: string,
+  description: string,
+  isPrivate: boolean,
+): RepoRec {
   const repo: RepoRec = {
-    dbId: state.dbSeq,
+    id: store.nextRepoId++,
+    owner,
     name,
     description,
     isPrivate,
     defaultBranch: 'main',
+    headRef: 'refs/heads/main',
+    objects: new Map(),
     refs: new Map(),
     labels: new Map(),
     issues: new Map(),
     pulls: new Map(),
     nextNumber: 1,
-    seq: state.repoSeq,
+    createdSeq: store.clockSeq + 1,
   };
-  state.repos.set(name.toLowerCase(), repo);
+  tickIso(store);
+  store.repos.set(repoKey(owner, name), repo);
   return repo;
 }
 
-function findRepo(owner: string, name: string): RepoRec | null {
-  learnLogin(owner);
-  if (state.login !== null && owner !== state.login) return null;
-  return state.repos.get(name.toLowerCase()) ?? null;
+// --- object access ----------------------------------------------------------
+
+function putObject(repo: RepoRec, type: ObjType, data: Buffer): string {
+  const oid = objectId(type, data);
+  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+  return oid;
 }
 
-// ---------------------------------------------------------------------------
-// git object model
-
-interface CommitInfo {
-  tree: string;
-  parents: string[];
-  message: string;
-  committerTime: number;
+function getObject(repo: RepoRec, oid: string): GitObject | undefined {
+  return repo.objects.get(oid);
 }
 
-function parseCommit(data: Buffer): CommitInfo {
-  const text = data.toString('utf8');
-  const blank = text.indexOf('\n\n');
-  const head = blank === -1 ? text : text.slice(0, blank);
-  const message = blank === -1 ? '' : text.slice(blank + 2);
-  let tree = ZERO_OID;
-  const parents: string[] = [];
-  let committerTime = 0;
-  for (const line of head.split('\n')) {
-    if (line.startsWith('tree ')) tree = line.slice(5).trim();
-    else if (line.startsWith('parent ')) parents.push(line.slice(7).trim());
-    else if (line.startsWith('committer ')) {
-      const match = / (\d+) [+-]\d{4}$/.exec(line);
-      if (match) committerTime = Number(match[1]);
-    }
-  }
-  return { tree, parents, message, committerTime };
-}
-
-function tagTarget(data: Buffer): string {
-  const match = /^object ([0-9a-f]{40})$/m.exec(data.toString('utf8'));
-  return match ? match[1] : ZERO_OID;
-}
-
-/** Peel an object id through tag objects until a non-tag object (or a missing id). */
-function peelToCommit(oid: string): string {
-  let current = oid;
-  for (let guard = 0; guard < 16; guard += 1) {
-    const obj = getObject(current);
-    if (obj === undefined || obj.type !== 'tag') return current;
-    current = tagTarget(obj.data);
-  }
-  return current;
-}
+// --- trees ------------------------------------------------------------------
 
 interface TreeEntry {
   mode: string;
@@ -212,10 +494,8 @@ function parseTree(data: Buffer): TreeEntry[] {
   let offset = 0;
   while (offset < data.length) {
     const space = data.indexOf(0x20, offset);
-    if (space === -1) break;
-    const mode = data.subarray(offset, space).toString('utf8');
+    const mode = data.subarray(offset, space).toString('ascii');
     const nul = data.indexOf(0x00, space + 1);
-    if (nul === -1 || nul + 21 > data.length) break;
     const name = data.subarray(space + 1, nul).toString('utf8');
     const oid = data.subarray(nul + 1, nul + 21).toString('hex');
     entries.push({ mode, name, oid });
@@ -224,1793 +504,1706 @@ function parseTree(data: Buffer): TreeEntry[] {
   return entries;
 }
 
-/** Git's tree order: by name, with directories sorting as if their name ended in '/'. */
-function treeEntryCompare(a: TreeEntry, b: TreeEntry): number {
-  const aKey = a.mode === '40000' ? `${a.name}/` : a.name;
-  const bKey = b.mode === '40000' ? `${b.name}/` : b.name;
-  return aKey < bKey ? -1 : aKey > bKey ? 1 : 0;
-}
-
-function buildTree(entries: TreeEntry[]): Buffer {
-  const sorted = [...entries].sort(treeEntryCompare);
+function serializeTree(entries: TreeEntry[]): Buffer {
+  const sorted = [...entries].sort((a, b) => {
+    const keyA = a.name + (a.mode === '40000' ? '/' : '');
+    const keyB = b.name + (b.mode === '40000' ? '/' : '');
+    return Buffer.compare(utf8(keyA), utf8(keyB));
+  });
   const parts: Buffer[] = [];
   for (const entry of sorted) {
-    parts.push(Buffer.from(`${entry.mode} ${entry.name}\0`, 'utf8'));
+    parts.push(utf8(`${entry.mode} ${entry.name}\0`));
     parts.push(Buffer.from(entry.oid, 'hex'));
   }
   return Buffer.concat(parts);
 }
 
-interface FlatEntry {
-  mode: string;
-  oid: string;
-}
-
-/** Flatten a tree object into a map of full path to blob entry, recursively. */
-function flattenTree(treeOid: string, prefix: string, out: Map<string, FlatEntry>): void {
-  const obj = getObject(treeOid);
-  if (obj === undefined || obj.type !== 'tree') return;
-  for (const entry of parseTree(obj.data)) {
-    const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
-    if (entry.mode === '40000') flattenTree(entry.oid, path, out);
-    else out.set(path, { mode: entry.mode, oid: entry.oid });
-  }
-}
-
-function flatMapOfCommit(commitOid: string): Map<string, FlatEntry> {
-  const out = new Map<string, FlatEntry>();
-  const obj = getObject(commitOid);
-  if (obj !== undefined && obj.type === 'commit') flattenTree(parseCommit(obj.data).tree, '', out);
+// Flatten a tree into path -> blob info, recursing into subtrees.
+function flattenTree(repo: RepoRec, treeOid: string): Map<string, { oid: string; mode: string }> {
+  const out = new Map<string, { oid: string; mode: string }>();
+  const walk = (oid: string, prefix: string): void => {
+    const object = getObject(repo, oid);
+    if (!object || object.type !== 'tree') return;
+    for (const entry of parseTree(object.data)) {
+      const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.mode === '40000') walk(entry.oid, path);
+      else out.set(path, { oid: entry.oid, mode: entry.mode });
+    }
+  };
+  walk(treeOid, '');
   return out;
 }
 
-/** Build (and store) nested tree objects from a flat path map; returns the root tree id. */
-function storeTreeFromFlat(flat: Map<string, FlatEntry>): string {
+// Rebuild nested trees from a flattened path map. Returns the root tree oid.
+function buildTreeFromFlat(repo: RepoRec, flat: Map<string, { oid: string; mode: string }>): string {
   interface DirNode {
-    files: Map<string, FlatEntry>;
+    files: { name: string; oid: string; mode: string }[];
     dirs: Map<string, DirNode>;
   }
-  const root: DirNode = { files: new Map(), dirs: new Map() };
-  for (const [path, entry] of flat) {
-    const parts = path.split('/');
+  const root: DirNode = { files: [], dirs: new Map() };
+  for (const [path, info] of flat) {
+    const segments = path.split('/');
     let node = root;
-    for (let i = 0; i < parts.length - 1; i += 1) {
-      const part = parts[i] as string;
-      if (!node.dirs.has(part)) node.dirs.set(part, { files: new Map(), dirs: new Map() });
-      node = node.dirs.get(part) as DirNode;
+    for (let i = 0; i < segments.length - 1; i++) {
+      let next = node.dirs.get(segments[i]);
+      if (!next) {
+        next = { files: [], dirs: new Map() };
+        node.dirs.set(segments[i], next);
+      }
+      node = next;
     }
-    node.files.set(parts[parts.length - 1] as string, entry);
+    node.files.push({ name: segments[segments.length - 1], oid: info.oid, mode: info.mode });
   }
-  const writeNode = (node: DirNode): string => {
+  const emit = (node: DirNode): string => {
     const entries: TreeEntry[] = [];
-    for (const [name, sub] of node.dirs) entries.push({ mode: '40000', name, oid: writeNode(sub) });
-    for (const [name, entry] of node.files) entries.push({ mode: entry.mode, name, oid: entry.oid });
-    return storeObject('tree', buildTree(entries));
+    for (const [name, child] of node.dirs) {
+      entries.push({ mode: '40000', name, oid: emit(child) });
+    }
+    for (const file of node.files) {
+      entries.push({ mode: file.mode, name: file.name, oid: file.oid });
+    }
+    return putObject(repo, 'tree', serializeTree(entries));
   };
-  return writeNode(root);
+  return emit(root);
 }
 
-const FORGE_IDENT = 'Forge Bot <forge@localhost>';
+// --- commits & tags ---------------------------------------------------------
 
-function makeCommit(tree: string, parents: string[], message: string): string {
-  const ts = nextTimestamp();
-  const lines = [`tree ${tree}`];
+interface CommitInfo {
+  tree: string;
+  parents: string[];
+  author: string;
+  committer: string;
+  message: string;
+}
+
+function parseCommit(data: Buffer): CommitInfo {
+  const splitAt = data.indexOf('\n\n');
+  const headerText = data.subarray(0, splitAt === -1 ? data.length : splitAt).toString('utf8');
+  const message = splitAt === -1 ? '' : data.subarray(splitAt + 2).toString('utf8');
+  const info: CommitInfo = { tree: '', parents: [], author: '', committer: '', message };
+  for (const line of headerText.split('\n')) {
+    if (line.startsWith('tree ')) info.tree = line.slice(5).trim();
+    else if (line.startsWith('parent ')) info.parents.push(line.slice(7).trim());
+    else if (line.startsWith('author ')) info.author = line.slice(7);
+    else if (line.startsWith('committer ')) info.committer = line.slice(10);
+  }
+  return info;
+}
+
+function makeCommit(
+  store: Store,
+  repo: RepoRec,
+  treeOid: string,
+  parents: string[],
+  message: string,
+): string {
+  const stamp = tickSeconds(store);
+  const ident = `${VIEWER_NAME} <${VIEWER_EMAIL}> ${stamp} +0000`;
+  const lines = [`tree ${treeOid}`];
   for (const parent of parents) lines.push(`parent ${parent}`);
-  lines.push(`author ${FORGE_IDENT} ${ts} +0000`);
-  lines.push(`committer ${FORGE_IDENT} ${ts} +0000`);
-  const data = Buffer.from(`${lines.join('\n')}\n\n${message}`, 'utf8');
-  return storeObject('commit', data);
+  lines.push(`author ${ident}`, `committer ${ident}`, '', message);
+  return putObject(repo, 'commit', utf8(lines.join('\n')));
 }
 
-/** Every commit reachable from a tip, newest first (committer time, then discovery order). */
-function listCommitsFrom(tip: string): string[] {
-  const result: string[] = [];
-  const seen = new Set<string>();
-  const frontier: string[] = [tip];
-  while (frontier.length > 0) {
-    let bestIndex = 0;
-    let bestTime = -1;
-    for (let i = 0; i < frontier.length; i += 1) {
-      const obj = getObject(frontier[i] as string);
-      const time = obj !== undefined && obj.type === 'commit' ? parseCommit(obj.data).committerTime : 0;
-      if (time >= bestTime) {
-        bestTime = time;
-        bestIndex = i;
+function parseTagTarget(data: Buffer): string {
+  for (const line of data.toString('utf8').split('\n')) {
+    if (line.startsWith('object ')) return line.slice(7).trim();
+    if (line === '') break;
+  }
+  return '';
+}
+
+// Follow tag objects until a non-tag object; returns that oid.
+function peelTag(repo: RepoRec, oid: string): string {
+  let current = oid;
+  for (let guard = 0; guard < 32; guard++) {
+    const object = getObject(repo, current);
+    if (!object || object.type !== 'tag') return current;
+    current = parseTagTarget(object.data);
+  }
+  return current;
+}
+
+// Resolve an oid to the commit it points at (through tags), or undefined.
+function resolveCommit(repo: RepoRec, oid: string): string | undefined {
+  const target = peelTag(repo, oid);
+  const object = getObject(repo, target);
+  return object && object.type === 'commit' ? target : undefined;
+}
+
+function commitTreeOid(repo: RepoRec, commitOid: string): string {
+  const object = getObject(repo, commitOid);
+  if (!object || object.type !== 'commit') return '';
+  return parseCommit(object.data).tree;
+}
+
+function branchTip(repo: RepoRec, branch: string): string | undefined {
+  return repo.refs.get(`refs/heads/${branch}`);
+}
+
+// Read a path inside a commit: file contents or a directory listing.
+type PathRead =
+  | { kind: 'file'; oid: string; data: Buffer }
+  | { kind: 'dir'; entries: { name: string; path: string; oid: string; type: 'file' | 'dir' }[] }
+  | null;
+
+function readPath(repo: RepoRec, commitOid: string, path: string): PathRead {
+  let treeOid = commitTreeOid(repo, commitOid);
+  if (!treeOid) return null;
+  const segments = path === '' ? [] : path.split('/');
+  for (let i = 0; i < segments.length; i++) {
+    const tree = getObject(repo, treeOid);
+    if (!tree || tree.type !== 'tree') return null;
+    const entries = parseTree(tree.data);
+    if (i === segments.length - 1) {
+      const entry = entries.find((candidate) => candidate.name === segments[i]);
+      if (!entry) return null;
+      if (entry.mode === '40000') {
+        const sub = getObject(repo, entry.oid);
+        if (!sub || sub.type !== 'tree') return null;
+        return {
+          kind: 'dir',
+          entries: parseTree(sub.data).map((child) => ({
+            name: child.name,
+            path: `${path}/${child.name}`,
+            oid: child.oid,
+            type: child.mode === '40000' ? ('dir' as const) : ('file' as const),
+          })),
+        };
       }
+      const blob = getObject(repo, entry.oid);
+      if (!blob) return null;
+      return { kind: 'file', oid: entry.oid, data: blob.data };
     }
-    const current = frontier.splice(bestIndex, 1)[0] as string;
-    if (seen.has(current)) continue;
-    const obj = getObject(current);
-    if (obj === undefined || obj.type !== 'commit') continue;
-    seen.add(current);
-    result.push(current);
-    for (const parent of parseCommit(obj.data).parents) {
-      if (!seen.has(parent)) frontier.push(parent);
-    }
+    const next = entries.find((candidate) => candidate.name === segments[i] && candidate.mode === '40000');
+    if (!next) return null;
+    treeOid = next.oid;
   }
-  return result;
+  // path === '' → the root directory listing.
+  const tree = getObject(repo, treeOid);
+  if (!tree || tree.type !== 'tree') return null;
+  return {
+    kind: 'dir',
+    entries: parseTree(tree.data).map((child) => ({
+      name: child.name,
+      path: child.name,
+      oid: child.oid,
+      type: child.mode === '40000' ? ('dir' as const) : ('file' as const),
+    })),
+  };
 }
 
-function ancestorsOf(tip: string): Set<string> {
+// --- ancestry & reachability --------------------------------------------------
+
+function isAncestor(repo: RepoRec, ancestor: string, descendant: string): boolean {
   const seen = new Set<string>();
-  const stack = [tip];
-  while (stack.length > 0) {
-    const current = stack.pop() as string;
-    if (seen.has(current)) continue;
-    const obj = getObject(current);
-    if (obj === undefined || obj.type !== 'commit') continue;
-    seen.add(current);
-    for (const parent of parseCommit(obj.data).parents) stack.push(parent);
-  }
-  return seen;
-}
-
-function isAncestor(ancestor: string, descendant: string): boolean {
-  if (ancestor === descendant) return true;
-  return ancestorsOf(descendant).has(ancestor);
-}
-
-/** The best common ancestor of two commits, or null when their histories are disjoint. */
-function mergeBaseOf(a: string, b: string): string | null {
-  const ancestorsA = ancestorsOf(a);
-  for (const candidate of listCommitsFrom(b)) {
-    if (ancestorsA.has(candidate)) return candidate;
-  }
-  return null;
-}
-
-// ---------------------------------------------------------------------------
-// packfiles and pkt-lines
-
-const TYPE_CODES: Record<string, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
-const CODE_TYPES: Record<number, GitObjectType> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
-
-/** Write a packfile holding the given objects, plain (no deltas), with its sha1 trailer. */
-function writePack(oids: string[]): Buffer {
-  const present = oids.filter((oid) => getObject(oid) !== undefined);
-  const parts: Buffer[] = [];
-  const header = Buffer.alloc(12);
-  header.write('PACK', 0, 'ascii');
-  header.writeUInt32BE(2, 4);
-  header.writeUInt32BE(present.length, 8);
-  parts.push(header);
-  for (const oid of present) {
-    const obj = getObject(oid) as StoredObject;
-    const size = obj.data.length;
-    const bytes: number[] = [];
-    let rest = size >> 4;
-    let first = ((TYPE_CODES[obj.type] as number) << 4) | (size & 0x0f);
-    if (rest > 0) first |= 0x80;
-    bytes.push(first);
-    while (rest > 0) {
-      let byte = rest & 0x7f;
-      rest >>= 7;
-      if (rest > 0) byte |= 0x80;
-      bytes.push(byte);
-    }
-    parts.push(Buffer.from(bytes));
-    parts.push(deflateSync(obj.data));
-  }
-  const body = Buffer.concat(parts);
-  const trailer = createHash('sha1').update(body).digest();
-  return Buffer.concat([body, trailer]);
-}
-
-/** The exact compressed length of the deflate stream starting at `offset` (binary search). */
-function inflateAt(buffer: Buffer, offset: number): { data: Buffer; consumed: number } {
-  let lo = 1;
-  let hi = buffer.length - offset;
-  let best = -1;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    try {
-      inflateSync(buffer.subarray(offset, offset + mid));
-      best = mid;
-      hi = mid - 1;
-    } catch {
-      lo = mid + 1;
-    }
-  }
-  if (best === -1) throw new Error('corrupt deflate stream in pack');
-  return { data: inflateSync(buffer.subarray(offset, offset + best)), consumed: best };
-}
-
-/** Apply a git delta (copy/insert instructions) to a base object. */
-function applyDelta(base: Buffer, delta: Buffer): Buffer {
-  let offset = 0;
-  const readVarint = (): number => {
-    let value = 0;
-    let shift = 0;
-    for (;;) {
-      const byte = delta[offset] as number;
-      offset += 1;
-      value |= (byte & 0x7f) << shift;
-      shift += 7;
-      if ((byte & 0x80) === 0) break;
-    }
-    return value;
-  };
-  const sourceSize = readVarint();
-  if (sourceSize !== base.length) throw new Error('delta base size mismatch');
-  const targetSize = readVarint();
-  const parts: Buffer[] = [];
-  let produced = 0;
-  while (offset < delta.length) {
-    const op = delta[offset] as number;
-    offset += 1;
-    if (op & 0x80) {
-      let copyOffset = 0;
-      let copySize = 0;
-      if (op & 0x01) { copyOffset = delta[offset] as number; offset += 1; }
-      if (op & 0x02) { copyOffset |= (delta[offset] as number) << 8; offset += 1; }
-      if (op & 0x04) { copyOffset |= (delta[offset] as number) << 16; offset += 1; }
-      if (op & 0x08) { copyOffset |= (delta[offset] as number) << 24; offset += 1; }
-      if (op & 0x10) { copySize = delta[offset] as number; offset += 1; }
-      if (op & 0x20) { copySize |= (delta[offset] as number) << 8; offset += 1; }
-      if (op & 0x40) { copySize |= (delta[offset] as number) << 16; offset += 1; }
-      if (copySize === 0) copySize = 0x10000;
-      parts.push(base.subarray(copyOffset, copyOffset + copySize));
-      produced += copySize;
-    } else if (op !== 0) {
-      parts.push(delta.subarray(offset, offset + op));
-      produced += op;
-      offset += op;
-    } else {
-      throw new Error('delta opcode 0 is reserved');
-    }
-  }
-  const out = Buffer.concat(parts);
-  if (produced !== targetSize || out.length !== targetSize) throw new Error('delta target size mismatch');
-  return out;
-}
-
-interface PackEntry {
-  oid: string;
-  type: GitObjectType;
-}
-
-/** Parse a packfile into the object store, resolving ofs/ref deltas. Returns the object ids added. */
-function readPack(pack: Buffer): PackEntry[] {
-  if (pack.length < 12 + 20 || pack.subarray(0, 4).toString('ascii') !== 'PACK') {
-    throw new Error('not a packfile');
-  }
-  const count = pack.readUInt32BE(8);
-  let offset = 12;
-  interface RawEntry {
-    type: GitObjectType;
-    data: Buffer;
-    baseOffset?: number;
-    baseOid?: string;
-    start: number;
-  }
-  const raw: RawEntry[] = [];
-  const byOffset = new Map<number, RawEntry>();
-  for (let i = 0; i < count; i += 1) {
-    const start = offset;
-    let byte = pack[offset] as number;
-    offset += 1;
-    const typeCode = (byte >> 4) & 0x07;
-    let size = byte & 0x0f;
-    let shift = 4;
-    while (byte & 0x80) {
-      byte = pack[offset] as number;
-      offset += 1;
-      size |= (byte & 0x7f) << shift;
-      shift += 7;
-    }
-    if (typeCode === 6) {
-      let back = pack[offset] as number;
-      offset += 1;
-      let baseBack = back & 0x7f;
-      while (back & 0x80) {
-        back = pack[offset] as number;
-        offset += 1;
-        baseBack = ((baseBack + 1) << 7) | (back & 0x7f);
-      }
-      const inflated = inflateAt(pack, offset);
-      offset += inflated.consumed;
-      const entry: RawEntry = { type: 'commit', data: inflated.data, baseOffset: start - baseBack, start };
-      raw.push(entry);
-      byOffset.set(start, entry);
-    } else if (typeCode === 7) {
-      const baseOid = pack.subarray(offset, offset + 20).toString('hex');
-      offset += 20;
-      const inflated = inflateAt(pack, offset);
-      offset += inflated.consumed;
-      const entry: RawEntry = { type: 'commit', data: inflated.data, baseOid, start };
-      raw.push(entry);
-      byOffset.set(start, entry);
-    } else {
-      const type = CODE_TYPES[typeCode];
-      if (type === undefined) throw new Error(`unknown pack object type ${typeCode}`);
-      const inflated = inflateAt(pack, offset);
-      offset += inflated.consumed;
-      if (inflated.data.length !== size) throw new Error('pack object size mismatch');
-      const entry: RawEntry = { type, data: inflated.data, start };
-      raw.push(entry);
-      byOffset.set(start, entry);
-    }
-  }
-  const resolved = new Map<number, PackEntry>();
-  const resolve = (entry: RawEntry): PackEntry => {
-    const cached = resolved.get(entry.start);
-    if (cached !== undefined) return cached;
-    let result: PackEntry;
-    if (entry.baseOffset !== undefined) {
-      const base = byOffset.get(entry.baseOffset);
-      if (base === undefined) throw new Error('ofs-delta base missing from pack');
-      const baseResolved = resolve(base);
-      const baseObj = getObject(baseResolved.oid);
-      if (baseObj === undefined) throw new Error('ofs-delta base not stored');
-      const data = applyDelta(baseObj.data, entry.data);
-      result = { oid: storeObject(baseResolved.type, data), type: baseResolved.type };
-    } else if (entry.baseOid !== undefined) {
-      const baseObj = getObject(entry.baseOid);
-      if (baseObj === undefined) throw new Error('ref-delta base not available');
-      const data = applyDelta(baseObj.data, entry.data);
-      result = { oid: storeObject(baseObj.type, data), type: baseObj.type };
-    } else {
-      result = { oid: storeObject(entry.type, entry.data), type: entry.type };
-    }
-    resolved.set(entry.start, result);
-    return result;
-  };
-  return raw.map((entry) => resolve(entry));
-}
-
-/** One pkt-line packet: a string payload, or the 'flush' / 'delim' control packets. */
-type Pkt = string | Buffer | 'flush' | 'delim';
-
-function pktEncode(items: Pkt[]): Buffer {
-  const parts: Buffer[] = [];
-  for (const item of items) {
-    if (item === 'flush') {
-      parts.push(Buffer.from('0000', 'ascii'));
-    } else if (item === 'delim') {
-      parts.push(Buffer.from('0001', 'ascii'));
-    } else {
-      const payload = typeof item === 'string' ? Buffer.from(item, 'utf8') : item;
-      const length = payload.length + 4;
-      parts.push(Buffer.from(length.toString(16).padStart(4, '0'), 'ascii'));
-      parts.push(payload);
-    }
-  }
-  return Buffer.concat(parts);
-}
-
-interface PktPacket {
-  kind: 'data' | 'flush' | 'delim';
-  payload: Buffer;
-}
-
-/** Decode a pkt-line stream; throws on a malformed frame. */
-function pktDecode(buffer: Buffer): PktPacket[] {
-  const packets: PktPacket[] = [];
-  let offset = 0;
-  while (offset < buffer.length) {
-    if (offset + 4 > buffer.length) throw new Error('truncated pkt-line');
-    const hex = buffer.subarray(offset, offset + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(hex)) throw new Error('malformed pkt-line length');
-    const length = parseInt(hex, 16);
-    if (length === 0) {
-      packets.push({ kind: 'flush', payload: Buffer.alloc(0) });
-      offset += 4;
-    } else if (length === 1) {
-      packets.push({ kind: 'delim', payload: Buffer.alloc(0) });
-      offset += 4;
-    } else if (length === 2) {
-      packets.push({ kind: 'flush', payload: Buffer.alloc(0) });
-      offset += 4;
-    } else {
-      if (length < 4 || offset + length > buffer.length) throw new Error('pkt-line overruns body');
-      packets.push({ kind: 'data', payload: buffer.subarray(offset + 4, offset + length) });
-      offset += length;
-    }
-  }
-  return packets;
-}
-
-/** Wrap a byte stream in sideband band-1 pkt-lines (payload at most 65516 bytes, band byte included). */
-function sidebandWrap(data: Buffer): Buffer {
-  const parts: Buffer[] = [];
-  for (let offset = 0; offset < data.length; offset += 65515) {
-    const chunk = data.subarray(offset, Math.min(data.length, offset + 65515));
-    const payload = Buffer.concat([Buffer.from([1]), chunk]);
-    parts.push(Buffer.from((payload.length + 4).toString(16).padStart(4, '0'), 'ascii'));
-    parts.push(payload);
-  }
-  return Buffer.concat(parts);
-}
-
-// ---------------------------------------------------------------------------
-// fetch computation
-
-interface FetchPlan {
-  packOids: string[];
-  shallow: string[];
-  unshallow: string[];
-  commonHaves: string[];
-}
-
-/** The closure of objects reachable from tips; commit parents of `shallowStop` commits are not walked. */
-function closureOf(tips: string[], shallowStop: Set<string>): Set<string> {
-  const out = new Set<string>();
-  const stack = [...tips];
-  while (stack.length > 0) {
-    const current = stack.pop() as string;
-    if (out.has(current)) continue;
-    const obj = getObject(current);
-    if (obj === undefined) continue;
-    out.add(current);
-    if (obj.type === 'commit') {
-      const info = parseCommit(obj.data);
-      stack.push(info.tree);
-      if (!shallowStop.has(current)) for (const parent of info.parents) stack.push(parent);
-    } else if (obj.type === 'tree') {
-      for (const entry of parseTree(obj.data)) stack.push(entry.oid);
-    } else if (obj.type === 'tag') {
-      stack.push(tagTarget(obj.data));
-    }
-  }
-  return out;
-}
-
-/**
- * Plan a fetch: which objects to pack, and the shallow boundary movement.
- * Depth is counted in commit generations from the wants; the client's own shallow
- * boundary stops the history walk the same way it stops the have walk.
- */
-function planFetch(
-  wants: string[],
-  haves: string[],
-  clientShallow: Set<string>,
-  depth: number | null,
-  deepenSince: number | null = null,
-  deepenNot: Set<string> = new Set(),
-): FetchPlan {
-  const haveObjs = closureOf(haves, clientShallow);
-
-  // Distances (in commit generations) from the wants.
-  const distance = new Map<string, number>();
-  const queue: Array<{ oid: string; dist: number }> = [];
-  const extraRoots: string[] = [];
-  for (const want of wants) {
-    const obj = getObject(want);
-    if (obj === undefined || deepenNot.has(want)) continue;
-    if (obj.type === 'commit') queue.push({ oid: want, dist: 0 });
-    else extraRoots.push(want);
-  }
+  const queue = [descendant];
   while (queue.length > 0) {
-    const { oid, dist } = queue.shift() as { oid: string; dist: number };
-    const known = distance.get(oid);
-    if (known !== undefined && known <= dist) continue;
-    distance.set(oid, dist);
-    if (depth !== null && dist + 1 >= depth) continue;
-    if (depth === null && deepenSince === null && clientShallow.has(oid)) continue;
-    const obj = getObject(oid);
-    if (obj === undefined || obj.type !== 'commit') continue;
-    const info = parseCommit(obj.data);
-    if (deepenSince !== null && info.committerTime > 0 && info.committerTime <= deepenSince) continue;
-    for (const parent of info.parents) {
-      if (!deepenNot.has(parent)) queue.push({ oid: parent, dist: dist + 1 });
+    const current = queue.shift() as string;
+    if (current === ancestor) return true;
+    if (seen.has(current)) continue;
+    seen.add(current);
+    const object = getObject(repo, current);
+    if (!object || object.type !== 'commit') continue;
+    queue.push(...parseCommit(object.data).parents);
+  }
+  return false;
+}
+
+function findMergeBase(repo: RepoRec, a: string, b: string): string | undefined {
+  const ancestorsOfA = new Set<string>();
+  const stack = [a];
+  while (stack.length > 0) {
+    const current = stack.pop() as string;
+    if (ancestorsOfA.has(current)) continue;
+    ancestorsOfA.add(current);
+    const object = getObject(repo, current);
+    if (object && object.type === 'commit') stack.push(...parseCommit(object.data).parents);
+  }
+  const seen = new Set<string>();
+  const queue = [b];
+  while (queue.length > 0) {
+    const current = queue.shift() as string;
+    if (ancestorsOfA.has(current)) return current;
+    if (seen.has(current)) continue;
+    seen.add(current);
+    const object = getObject(repo, current);
+    if (object && object.type === 'commit') queue.push(...parseCommit(object.data).parents);
+  }
+  return undefined;
+}
+
+// Every object reachable from the given roots (full closure).
+function closureFull(repo: RepoRec, roots: string[]): Set<string> {
+  const out = new Set<string>();
+  const visit = (oid: string): void => {
+    if (out.has(oid)) return;
+    const object = getObject(repo, oid);
+    if (!object) return;
+    out.add(oid);
+    if (object.type === 'commit') {
+      const info = parseCommit(object.data);
+      visit(info.tree);
+      for (const parent of info.parents) visit(parent);
+    } else if (object.type === 'tree') {
+      for (const entry of parseTree(object.data)) visit(entry.oid);
+    } else if (object.type === 'tag') {
+      visit(parseTagTarget(object.data));
+    }
+  };
+  for (const root of roots) visit(root);
+  return out;
+}
+
+// Depth-limited closure used by shallow fetches. Commits at generation
+// depth-1 form the boundary; commits in `cut` are included but their
+// parents are not traversed (used to model what a shallow client holds).
+function closureDepth(
+  repo: RepoRec,
+  roots: string[],
+  depth: number | null,
+  cut: Set<string>,
+): { objects: Set<string>; boundary: Set<string> } {
+  const objects = new Set<string>();
+  const boundary = new Set<string>();
+  const addTreeClosure = (treeOid: string): void => {
+    const visit = (oid: string): void => {
+      if (objects.has(oid)) return;
+      const object = getObject(repo, oid);
+      if (!object) return;
+      objects.add(oid);
+      if (object.type === 'tree') {
+        for (const entry of parseTree(object.data)) visit(entry.oid);
+      }
+    };
+    visit(treeOid);
+  };
+  const queue: { oid: string; generation: number }[] = [];
+  for (const root of roots) {
+    const commit = resolveCommit(repo, root);
+    if (commit) queue.push({ oid: commit, generation: 0 });
+    else if (getObject(repo, root)) objects.add(root);
+    // Tag objects themselves are part of the closure.
+    let cursor = root;
+    while (getObject(repo, cursor)?.type === 'tag') {
+      objects.add(cursor);
+      cursor = parseTagTarget((getObject(repo, cursor) as GitObject).data);
     }
   }
+  const seenCommits = new Set<string>();
+  while (queue.length > 0) {
+    const { oid, generation } = queue.shift() as { oid: string; generation: number };
+    if (seenCommits.has(oid)) continue;
+    seenCommits.add(oid);
+    const object = getObject(repo, oid);
+    if (!object || object.type !== 'commit') continue;
+    objects.add(oid);
+    const info = parseCommit(object.data);
+    addTreeClosure(info.tree);
+    const atBoundary = depth !== null && generation >= depth - 1;
+    if (atBoundary || cut.has(oid)) {
+      if (info.parents.length > 0) boundary.add(oid);
+      continue;
+    }
+    for (const parent of info.parents) queue.push({ oid: parent, generation: generation + 1 });
+  }
+  return { objects, boundary };
+}
 
-  const included = new Set<string>();
-  for (const root of extraRoots) {
-    for (const oid of closureOf([root], new Set())) included.add(oid);
-  }
-  for (const oid of distance.keys()) {
-    const obj = getObject(oid);
-    if (obj === undefined || obj.type !== 'commit') continue;
-    included.add(oid);
-    for (const sub of closureOf([parseCommit(obj.data).tree], new Set())) included.add(sub);
-  }
+// --- three-way tree merge (squash merges & conflict detection) --------------
 
-  const shallow: string[] = [];
-  const unshallow: string[] = [];
-  for (const oid of distance.keys()) {
-    const obj = getObject(oid);
-    if (obj === undefined || obj.type !== 'commit') continue;
-    const parents = parseCommit(obj.data).parents;
-    if (parents.length === 0) continue;
-    const parentsIncluded = parents.every((parent) => included.has(parent) || haveObjs.has(parent));
-    if (!parentsIncluded) shallow.push(oid);
-    else if (clientShallow.has(oid)) unshallow.push(oid);
+function tryMergeTrees(
+  repo: RepoRec,
+  baseTip: string,
+  headTip: string,
+): { conflict: boolean; treeOid?: string } {
+  const mergeBase = findMergeBase(repo, headTip, baseTip);
+  const baseMap = mergeBase
+    ? flattenTree(repo, commitTreeOid(repo, mergeBase))
+    : new Map<string, { oid: string; mode: string }>();
+  const oursMap = flattenTree(repo, commitTreeOid(repo, baseTip));
+  const theirsMap = flattenTree(repo, commitTreeOid(repo, headTip));
+  const merged = new Map(oursMap);
+  const paths = new Set([...baseMap.keys(), ...oursMap.keys(), ...theirsMap.keys()]);
+  for (const path of paths) {
+    const base = baseMap.get(path)?.oid;
+    const ours = oursMap.get(path)?.oid;
+    const theirs = theirsMap.get(path)?.oid;
+    if (ours === theirs) {
+      if (ours === undefined) merged.delete(path);
+      continue;
+    }
+    if (base === ours) {
+      if (theirs === undefined) merged.delete(path);
+      else merged.set(path, theirsMap.get(path) as { oid: string; mode: string });
+      continue;
+    }
+    if (base === theirs) continue;
+    return { conflict: true };
   }
-  for (const oid of clientShallow) {
-    if (included.has(oid) && !shallow.includes(oid) && !unshallow.includes(oid)) {
-      const obj = getObject(oid);
-      if (obj !== undefined && obj.type === 'commit' && parseCommit(obj.data).parents.length > 0) shallow.push(oid);
+  return { conflict: false, treeOid: buildTreeFromFlat(repo, merged) };
+}
+
+// Diff two trees path-by-path (used for pull request file lists).
+interface FileChange {
+  filename: string;
+  status: 'added' | 'modified' | 'removed';
+  additions: number;
+  deletions: number;
+  changes: number;
+  sha: string;
+}
+
+function diffTrees(repo: RepoRec, fromTree: string, toTree: string): FileChange[] {
+  const fromMap = fromTree
+    ? flattenTree(repo, fromTree)
+    : new Map<string, { oid: string; mode: string }>();
+  const toMap = toTree
+    ? flattenTree(repo, toTree)
+    : new Map<string, { oid: string; mode: string }>();
+  const changes: FileChange[] = [];
+  const paths = new Set([...fromMap.keys(), ...toMap.keys()]);
+  for (const path of [...paths].sort()) {
+    const from = fromMap.get(path);
+    const to = toMap.get(path);
+    if (from && !to) {
+      changes.push({
+        filename: path,
+        status: 'removed',
+        additions: 0,
+        deletions: countLines((getObject(repo, from.oid) as GitObject).data),
+        changes: countLines((getObject(repo, from.oid) as GitObject).data),
+        sha: from.oid,
+      });
+    } else if (!from && to) {
+      const lines = countLines((getObject(repo, to.oid) as GitObject).data);
+      changes.push({ filename: path, status: 'added', additions: lines, deletions: 0, changes: lines, sha: to.oid });
+    } else if (from && to && from.oid !== to.oid) {
+      const additions = countLines((getObject(repo, to.oid) as GitObject).data);
+      const deletions = countLines((getObject(repo, from.oid) as GitObject).data);
+      changes.push({
+        filename: path,
+        status: 'modified',
+        additions,
+        deletions,
+        changes: additions + deletions,
+        sha: to.oid,
+      });
     }
   }
-
-  const packOids: string[] = [];
-  for (const oid of included) {
-    if (!haveObjs.has(oid)) packOids.push(oid);
-  }
-  const commonHaves = haves.filter((have) => getObject(have) !== undefined);
-  return { packOids, shallow, unshallow, commonHaves };
+  return changes;
 }
 
 // ---------------------------------------------------------------------------
-// HTTP plumbing
+// HTTP plumbing.
+// ---------------------------------------------------------------------------
 
-interface ReqInfo {
-  method: string;
-  segments: string[];
-  query: URLSearchParams;
-  headers: IncomingMessage['headers'];
+interface RequestContext {
+  store: Store;
+  req: IncomingMessage;
+  url: URL;
   body: Buffer;
-  host: string;
+  jsonCache: { parsed: boolean; value: unknown };
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
-  const text = body === undefined ? '' : JSON.stringify(body);
-  state.reqSeq += 1;
+function sendBuffer(
+  res: ServerResponse,
+  status: number,
+  body: Buffer,
+  contentType: string,
+  extraHeaders: Record<string, string> = {},
+): void {
   res.writeHead(status, {
-    'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
-    'x-github-request-id': `FORGE-${state.reqSeq.toString(16).toUpperCase().padStart(6, '0')}`,
-    ...extra,
-  });
-  res.end(text);
-}
-
-function sendRaw(res: ServerResponse, status: number, body: Buffer, contentType: string): void {
-  state.reqSeq += 1;
-  res.writeHead(status, {
-    'content-type': contentType,
-    'content-length': body.length,
-    'x-github-request-id': `FORGE-${state.reqSeq.toString(16).toUpperCase().padStart(6, '0')}`,
+    'Content-Type': contentType,
+    'Content-Length': body.length,
+    ...extraHeaders,
   });
   res.end(body);
 }
 
-function notFound(res: ServerResponse): void {
-  sendJson(res, 404, { message: 'Not Found' });
+function sendJson(
+  store: Store,
+  res: ServerResponse,
+  status: number,
+  value: unknown,
+  extraHeaders: Record<string, string> = {},
+): void {
+  store.requestSeq += 1;
+  sendBuffer(res, status, utf8(JSON.stringify(value)), 'application/json; charset=utf-8', {
+    'X-GitHub-Request-Id': `forge-${store.requestSeq}`,
+    ...extraHeaders,
+  });
 }
 
-function authed(info: ReqInfo): boolean {
-  const header = info.headers.authorization;
-  if (TOKEN !== '') return header === `Bearer ${TOKEN}`;
-  return typeof header === 'string' && header.startsWith('Bearer ') && header.length > 7;
+function sendError(store: Store, res: ServerResponse, status: number, message: string): void {
+  sendJson(store, res, status, { message });
 }
 
-/** Parse a JSON body; on failure answers 400 and returns the sentinel. */
-const BAD_JSON = Symbol('bad-json');
-function jsonBody(info: ReqInfo, res: ServerResponse): unknown {
-  if (info.body.length === 0) return {};
+function requestJson(ctx: RequestContext): { ok: boolean; value: Record<string, unknown> } {
+  if (ctx.jsonCache.parsed) {
+    return { ok: true, value: ctx.jsonCache.value as Record<string, unknown> };
+  }
+  const text = ctx.body.toString('utf8').trim();
+  if (text === '') {
+    ctx.jsonCache = { parsed: true, value: {} };
+    return { ok: true, value: {} };
+  }
   try {
-    return JSON.parse(info.body.toString('utf8'));
+    const value = JSON.parse(text) as unknown;
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      return { ok: false, value: {} };
+    }
+    ctx.jsonCache = { parsed: true, value };
+    return { ok: true, value: value as Record<string, unknown> };
   } catch {
-    sendJson(res, 400, { message: 'Problems parsing JSON' });
-    return BAD_JSON;
+    return { ok: false, value: {} };
   }
 }
 
-function asRecord(value: unknown): Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+function isAuthed(req: IncomingMessage): boolean {
+  const header = req.headers['authorization'];
+  if (typeof header !== 'string') return false;
+  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
+  if (!match) return false;
+  const presented = match[1].trim();
+  if (presented === '') return false;
+  const expected = process.env.MAKEFUN_SHOP_TOKEN;
+  if (expected !== undefined && expected !== '') return presented === expected;
+  return true;
 }
 
-function strField(record: Record<string, unknown>, key: string): string | undefined {
-  const value = record[key];
-  return typeof value === 'string' ? value : undefined;
+function originOf(req: IncomingMessage): string {
+  const host = req.headers['host'];
+  return `http://${typeof host === 'string' && host !== '' ? host : '127.0.0.1'}`;
 }
 
 // ---------------------------------------------------------------------------
-// REST view builders
+// REST serializers.
+// ---------------------------------------------------------------------------
+
+function userJson(login: string): Record<string, unknown> {
+  return {
+    login,
+    id: login === VIEWER_LOGIN ? VIEWER_ID : 0,
+    type: 'User',
+    name: login === VIEWER_LOGIN ? VIEWER_NAME : login,
+    email: login === VIEWER_LOGIN ? VIEWER_EMAIL : `${login}@example.invalid`,
+  };
+}
 
 function repoJson(repo: RepoRec): Record<string, unknown> {
-  const login = viewerLogin();
-  const ts = isoOf(1767225600 + repo.seq * 61);
+  const openIssues = [...repo.issues.values()].filter((issue) => issue.state === 'open').length;
+  const openPulls = [...repo.pulls.values()].filter((pull) => pull.state === 'open').length;
   return {
-    id: repo.dbId,
-    node_id: Buffer.from(`Repository:${repo.dbId}`).toString('base64'),
+    id: repo.id,
+    node_id: `repo-${repo.id}`,
     name: repo.name,
-    full_name: `${login}/${repo.name}`,
-    owner: { login, id: 1000, node_id: Buffer.from(`User:${login}`).toString('base64'), type: 'User' },
+    full_name: repoKey(repo.owner, repo.name),
+    owner: userJson(repo.owner),
     private: repo.isPrivate,
     description: repo.description,
-    fork: false,
-    html_url: `http://forge.local/${login}/${repo.name}`,
-    clone_url: `http://forge.local/${login}/${repo.name}.git`,
     default_branch: repo.defaultBranch,
-    created_at: ts,
-    updated_at: ts,
-    pushed_at: ts,
+    html_url: `https://forge.invalid/${repo.owner}/${repo.name}`,
+    url: `https://forge.invalid/api/v3/repos/${repo.owner}/${repo.name}`,
+    created_at: new Date((EPOCH_SECONDS + repo.createdSeq) * 1000).toISOString(),
+    updated_at: new Date((EPOCH_SECONDS + repo.createdSeq) * 1000).toISOString(),
+    has_issues: true,
+    has_pull_requests: true,
+    open_issues_count: openIssues + openPulls,
+    visibility: repo.isPrivate ? 'private' : 'public',
+    size: 0,
+    stargazers_count: 0,
+    forks_count: 0,
   };
 }
 
 function labelJson(label: LabelRec): Record<string, unknown> {
-  return { name: label.name, color: label.color, description: label.description, default: false };
+  return { name: label.name, color: label.color, default: false };
 }
 
 function issueJson(repo: RepoRec, issue: IssueRec): Record<string, unknown> {
-  const login = viewerLogin();
-  const ts = isoOf(1767225600 + issue.seq * 61);
   return {
-    id: issue.dbId,
-    node_id: Buffer.from(`Issue:${repo.dbId}:${issue.number}`).toString('base64'),
+    id: issue.id,
+    node_id: `issue-${repo.id}-${issue.number}`,
     number: issue.number,
     title: issue.title,
     body: issue.body,
     state: issue.state,
-    labels: issue.labels.map((name) => labelJson(repo.labels.get(name) ?? { name, color: 'ededed', description: null })),
-    user: { login, id: 1000, type: 'User' },
+    labels: issue.labels
+      .map((name) => repo.labels.get(name))
+      .filter((label): label is LabelRec => label !== undefined)
+      .map(labelJson),
+    user: userJson(VIEWER_LOGIN),
+    author: userJson(VIEWER_LOGIN),
     comments: issue.comments.length,
-    created_at: ts,
-    updated_at: ts,
-    closed_at: issue.state === 'closed' ? ts : null,
-    html_url: `http://forge.local/${login}/${repo.name}/issues/${issue.number}`,
+    created_at: new Date((EPOCH_SECONDS + issue.createdSeq) * 1000).toISOString(),
+    updated_at: new Date((EPOCH_SECONDS + issue.createdSeq) * 1000).toISOString(),
+    html_url: `https://forge.invalid/${repo.owner}/${repo.name}/issues/${issue.number}`,
   };
 }
 
-function refSha(repo: RepoRec, refName: string): string | null {
-  const oid = repo.refs.get(`refs/heads/${refName}`) ?? repo.refs.get(refName);
-  return oid === undefined ? null : oid;
+function commentJson(comment: CommentRec): Record<string, unknown> {
+  return {
+    id: comment.id,
+    body: comment.body,
+    user: userJson(comment.author),
+    author: userJson(comment.author),
+    created_at: new Date((EPOCH_SECONDS + comment.createdSeq) * 1000).toISOString(),
+    updated_at: new Date((EPOCH_SECONDS + comment.createdSeq) * 1000).toISOString(),
+  };
 }
 
 function pullJson(repo: RepoRec, pull: PullRec): Record<string, unknown> {
-  const login = viewerLogin();
-  const ts = isoOf(1767225600 + pull.seq * 61);
-  const headSha = refSha(repo, pull.headRef);
-  const baseSha = refSha(repo, pull.baseRef);
+  const headSha = branchTip(repo, pull.headRef) ?? pull.headShaAtCreate;
+  const baseSha = branchTip(repo, pull.baseRef) ?? pull.baseShaAtCreate;
+  let mergeable: boolean | null = null;
+  if (pull.state === 'open' && !pull.merged) {
+    const baseTipNow = branchTip(repo, pull.baseRef);
+    const headTipNow = branchTip(repo, pull.headRef);
+    if (baseTipNow && headTipNow) {
+      mergeable = !tryMergeTrees(repo, baseTipNow, headTipNow).conflict;
+    }
+  }
   return {
-    id: pull.dbId,
-    node_id: Buffer.from(`PullRequest:${repo.dbId}:${pull.number}`).toString('base64'),
+    id: pull.id,
+    node_id: `pull-${repo.id}-${pull.number}`,
     number: pull.number,
-    state: pull.state,
     title: pull.title,
     body: pull.body,
-    user: { login, id: 1000, type: 'User' },
-    head: {
-      ref: pull.headRef,
-      sha: headSha ?? ZERO_OID,
-      label: `${login}:${pull.headRef}`,
-      repo: repoJson(repo),
-    },
-    base: {
-      ref: pull.baseRef,
-      sha: baseSha ?? ZERO_OID,
-      label: `${login}:${pull.baseRef}`,
-      repo: repoJson(repo),
-    },
+    state: pull.state,
     merged: pull.merged,
-    merged_at: pull.merged ? ts : null,
+    merged_at: pull.mergedAt,
     merge_commit_sha: pull.mergeCommitSha,
-    mergeable: pull.state === 'open' ? mergeSimulation(repo, pull).conflict === false : null,
-    draft: false,
-    created_at: ts,
-    updated_at: ts,
-    html_url: `http://forge.local/${login}/${repo.name}/pull/${pull.number}`,
+    mergeable,
+    mergeable_state: mergeable === null ? 'unknown' : mergeable ? 'clean' : 'dirty',
+    head: { label: `${repo.owner}:${pull.headRef}`, ref: pull.headRef, sha: headSha },
+    base: { label: `${repo.owner}:${pull.baseRef}`, ref: pull.baseRef, sha: baseSha },
+    user: userJson(VIEWER_LOGIN),
+    author: userJson(VIEWER_LOGIN),
+    created_at: new Date((EPOCH_SECONDS + pull.createdSeq) * 1000).toISOString(),
+    updated_at: new Date((EPOCH_SECONDS + pull.createdSeq) * 1000).toISOString(),
+    html_url: `https://forge.invalid/${repo.owner}/${repo.name}/pull/${pull.number}`,
   };
 }
 
-// ---------------------------------------------------------------------------
-// merge machinery (three-way, per path, against the merge base)
-
-interface MergeOutcome {
-  conflict: boolean;
-  tree: string | null;
+function parseIdent(ident: string): { name: string; email: string; date: string } {
+  const match = /^(.*) <(.*)> (\d+) [+-]\d{4}$/.exec(ident);
+  if (!match) return { name: ident, email: '', date: new Date(EPOCH_SECONDS * 1000).toISOString() };
+  return {
+    name: match[1],
+    email: match[2],
+    date: new Date(Number(match[3]) * 1000).toISOString(),
+  };
 }
 
-/** Simulate (or perform) a squash of the pull's head onto its base branch. */
-function mergeSimulation(repo: RepoRec, pull: PullRec): MergeOutcome {
-  const headOid = refSha(repo, pull.headRef);
-  const baseOid = refSha(repo, pull.baseRef);
-  if (headOid === null || baseOid === null) return { conflict: true, tree: null };
-  const headCommit = peelToCommit(headOid);
-  const baseCommit = peelToCommit(baseOid);
-  const base = mergeBaseOf(headCommit, baseCommit);
-  if (base === null) return { conflict: true, tree: null };
-  const baseMap = flatMapOfCommit(base);
-  const headMap = flatMapOfCommit(headCommit);
-  const targetMap = flatMapOfCommit(baseCommit);
-  const result = new Map(targetMap);
-  const paths = new Set<string>([...baseMap.keys(), ...headMap.keys()]);
-  for (const path of paths) {
-    const inBase = baseMap.get(path);
-    const inHead = headMap.get(path);
-    const inTarget = targetMap.get(path);
-    const headChanged = (inHead?.oid ?? null) !== (inBase?.oid ?? null);
-    if (!headChanged) continue;
-    const targetChanged = (inTarget?.oid ?? null) !== (inBase?.oid ?? null);
-    if (targetChanged && (inTarget?.oid ?? null) !== (inHead?.oid ?? null)) {
-      return { conflict: true, tree: null };
-    }
-    if (inHead === undefined) result.delete(path);
-    else result.set(path, inHead);
-  }
-  return { conflict: false, tree: storeTreeFromFlat(result) };
+function commitJson(repo: RepoRec, oid: string): Record<string, unknown> {
+  const object = getObject(repo, oid) as GitObject;
+  const info = parseCommit(object.data);
+  return {
+    sha: oid,
+    node_id: `commit-${oid}`,
+    commit: {
+      message: info.message.replace(/\n+$/, ''),
+      author: parseIdent(info.author),
+      committer: parseIdent(info.committer),
+      tree: { sha: info.tree },
+    },
+    parents: info.parents.map((parent) => ({ sha: parent })),
+    html_url: `https://forge.invalid/commit/${oid}`,
+  };
 }
 
-/** Perform the merge: one squash commit on the base branch; returns its sha, or null on conflict. */
-function performMerge(repo: RepoRec, pull: PullRec, method: string): string | null {
-  const outcome = mergeSimulation(repo, pull);
-  if (outcome.conflict || outcome.tree === null) return null;
-  const baseOid = refSha(repo, pull.baseRef) as string;
-  const baseCommit = peelToCommit(baseOid);
-  let sha: string;
-  if (method === 'merge') {
-    const headCommit = peelToCommit(refSha(repo, pull.headRef) as string);
-    const ts = nextTimestamp();
-    const lines = [
-      `tree ${outcome.tree}`,
-      `parent ${baseCommit}`,
-      `parent ${headCommit}`,
-      `author ${FORGE_IDENT} ${ts} +0000`,
-      `committer ${FORGE_IDENT} ${ts} +0000`,
-    ];
-    sha = storeObject('commit', Buffer.from(`${lines.join('\n')}\n\nMerge pull request #${pull.number} from ${pull.headRef}\n\n${pull.title}`, 'utf8'));
-  } else {
-    sha = makeCommit(outcome.tree, [baseCommit], `${pull.title} (#${pull.number})`);
-  }
+// Shared pull-request merge execution (REST + GraphQL + MCP all land here).
+function executeSquashMerge(
+  store: Store,
+  repo: RepoRec,
+  pull: PullRec,
+): { ok: true; sha: string } | { ok: false; conflict: boolean } {
+  const baseTip = branchTip(repo, pull.baseRef);
+  const headTip = branchTip(repo, pull.headRef);
+  if (!baseTip || !headTip) return { ok: false, conflict: false };
+  const attempt = tryMergeTrees(repo, baseTip, headTip);
+  if (attempt.conflict || attempt.treeOid === undefined) return { ok: false, conflict: true };
+  const sha = makeCommit(store, repo, attempt.treeOid, [baseTip], pull.title);
   repo.refs.set(`refs/heads/${pull.baseRef}`, sha);
   pull.state = 'closed';
   pull.merged = true;
+  pull.mergedAt = tickIso(store);
   pull.mergeCommitSha = sha;
-  return sha;
+  return { ok: true, sha };
 }
 
-/** The files a pull request changes: head versus the merge base, with line counts. */
-function pullFiles(repo: RepoRec, pull: PullRec): Array<Record<string, unknown>> {
-  const headOid = refSha(repo, pull.headRef);
-  const baseOid = refSha(repo, pull.baseRef);
-  if (headOid === null || baseOid === null) return [];
-  const headCommit = peelToCommit(headOid);
-  const baseCommit = peelToCommit(baseOid);
-  const base = mergeBaseOf(headCommit, baseCommit) ?? baseCommit;
-  const baseMap = flatMapOfCommit(base);
-  const headMap = flatMapOfCommit(headCommit);
-  const files: Array<Record<string, unknown>> = [];
-  const paths = new Set<string>([...baseMap.keys(), ...headMap.keys()]);
-  const lineCount = (oid: string | undefined): number => {
-    if (oid === undefined) return 0;
-    const obj = getObject(oid);
-    if (obj === undefined) return 0;
-    return obj.data.toString('utf8').split('\n').length;
+function createPullRec(
+  store: Store,
+  repo: RepoRec,
+  title: string,
+  body: string,
+  headRef: string,
+  baseRef: string,
+): PullRec {
+  const pull: PullRec = {
+    id: store.nextPullId++,
+    number: repo.nextNumber++,
+    title,
+    body,
+    state: 'open',
+    merged: false,
+    mergedAt: null,
+    mergeCommitSha: null,
+    headRef,
+    baseRef,
+    headShaAtCreate: branchTip(repo, headRef) ?? ZERO_OID,
+    baseShaAtCreate: branchTip(repo, baseRef) ?? ZERO_OID,
+    createdSeq: store.clockSeq + 1,
   };
-  for (const path of [...paths].sort()) {
-    const before = baseMap.get(path);
-    const after = headMap.get(path);
-    if ((before?.oid ?? null) === (after?.oid ?? null)) continue;
-    const status = before === undefined ? 'added' : after === undefined ? 'removed' : 'modified';
-    const additions = after === undefined ? 0 : lineCount(after.oid);
-    const deletions = before === undefined ? 0 : lineCount(before.oid);
-    files.push({
-      sha: after?.oid ?? before?.oid,
-      filename: path,
-      status,
-      additions,
-      deletions,
-      changes: additions + deletions,
-    });
-  }
-  return files;
+  tickIso(store);
+  repo.pulls.set(pull.number, pull);
+  return pull;
 }
 
-// ---------------------------------------------------------------------------
-// REST v3
-
-function pageParams(info: ReqInfo): { page: number; perPage: number } {
-  const perPageRaw = Number(info.query.get('per_page') ?? '30');
-  const pageRaw = Number(info.query.get('page') ?? '1');
-  return {
-    perPage: Number.isFinite(perPageRaw) && perPageRaw > 0 ? Math.min(100, Math.floor(perPageRaw)) : 30,
-    page: Number.isFinite(pageRaw) && pageRaw > 0 ? Math.floor(pageRaw) : 1,
-  };
-}
-
-/** Slice one page out of a list and add GitHub's Link header when more pages exist. */
-function paginate<T>(info: ReqInfo, res: ServerResponse, items: T[], basePath: string): T[] {
-  const { page, perPage } = pageParams(info);
-  const totalPages = Math.max(1, Math.ceil(items.length / perPage));
-  const slice = items.slice((page - 1) * perPage, page * perPage);
-  if (page < totalPages) {
-    const kept = new URLSearchParams();
-    for (const [key, value] of info.query) {
-      if (key !== 'page' && key !== 'per_page') kept.set(key, value);
-    }
-    kept.set('per_page', String(perPage));
-    kept.set('page', String(page + 1));
-    const next = `http://${info.host}${basePath}?${kept.toString()}`;
-    kept.set('page', String(totalPages));
-    const last = `http://${info.host}${basePath}?${kept.toString()}`;
-    res.setHeader('link', `<${next}>; rel="next", <${last}>; rel="last"`);
-  }
-  return slice;
-}
-
-function createIssueRec(repo: RepoRec, title: string, body: string, labels: string[]): IssueRec {
-  state.dbSeq += 1;
-  const number = repo.nextNumber;
-  repo.nextNumber += 1;
+function createIssueRec(
+  store: Store,
+  repo: RepoRec,
+  title: string,
+  body: string,
+  labels: string[],
+): IssueRec {
   const issue: IssueRec = {
-    dbId: state.dbSeq,
-    number,
+    id: store.nextIssueId++,
+    number: repo.nextNumber++,
     title,
     body,
     state: 'open',
     labels: [...labels],
     comments: [],
-    seq: ++state.repoSeq,
+    createdSeq: store.clockSeq + 1,
   };
-  repo.issues.set(number, issue);
+  tickIso(store);
+  repo.issues.set(issue.number, issue);
   return issue;
 }
 
-function createPullRec(repo: RepoRec, title: string, body: string, headRef: string, baseRef: string): PullRec {
-  state.dbSeq += 1;
-  const number = repo.nextNumber;
-  repo.nextNumber += 1;
-  const pull: PullRec = {
-    dbId: state.dbSeq,
-    number,
-    title,
-    body,
-    state: 'open',
-    headRef,
-    baseRef,
-    merged: false,
-    mergeCommitSha: null,
-    seq: ++state.repoSeq,
-  };
-  repo.pulls.set(number, pull);
-  return pull;
+// ---------------------------------------------------------------------------
+// REST v3 handlers. `segments` is the path after /api/v3, already decoded.
+// ---------------------------------------------------------------------------
+
+function paginationParams(url: URL): { perPage: number; page: number } {
+  const perPageRaw = Number(url.searchParams.get('per_page') ?? '30');
+  const pageRaw = Number(url.searchParams.get('page') ?? '1');
+  const perPage = Number.isFinite(perPageRaw) && perPageRaw > 0 ? Math.min(100, Math.floor(perPageRaw)) : 30;
+  const page = Number.isFinite(pageRaw) && pageRaw > 0 ? Math.floor(pageRaw) : 1;
+  return { perPage, page };
 }
 
-/** The branch a contents or commit operation addresses: the body's/query's branch or the default. */
-function branchTip(repo: RepoRec, branch: string | undefined): { ref: string; tip: string | null } {
-  const name = branch ?? repo.defaultBranch;
-  const ref = `refs/heads/${name}`;
-  return { ref, tip: repo.refs.get(ref) ?? null };
-}
+function routeRest(ctx: RequestContext, res: ServerResponse, segments: string[]): void {
+  const { store, req } = ctx;
+  const method = (req.method ?? 'GET').toUpperCase();
 
-function handleContents(info: ReqInfo, res: ServerResponse, repo: RepoRec, path: string): void {
-  const method = info.method;
-  if (method === 'GET') {
-    const ref = info.query.get('ref') ?? undefined;
-    let tip: string | null;
-    if (ref !== undefined && isOid(ref) && getObject(ref)?.type === 'commit') tip = ref;
-    else tip = branchTip(repo, ref).tip;
-    if (tip === null) {
-      if (path === '') {
-        sendJson(res, 200, []);
-        return;
-      }
-      notFound(res);
+  // Body-bearing verbs must carry valid JSON when a body is present.
+  let body: Record<string, unknown> = {};
+  if (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') {
+    const parsed = requestJson(ctx);
+    if (!parsed.ok) {
+      sendError(store, res, 400, 'Malformed JSON in request body');
       return;
     }
-    const commit = getObject(tip);
-    if (commit === undefined || commit.type !== 'commit') {
-      notFound(res);
+    body = parsed.value;
+  }
+
+  if (segments.length === 0) {
+    if (method === 'GET') {
+      sendJson(store, res, 200, {
+        current_user_url: `${originOf(req)}/api/v3/user`,
+        repository_url: `${originOf(req)}/api/v3/repos/{owner}/{repo}`,
+        emojis_url: `${originOf(req)}/api/v3/emojis`,
+      }, { 'X-OAuth-Scopes': 'repo, user, read:org, write:org' });
       return;
     }
-    const flat = flatMapOfCommit(tip);
-    const clean = path.replace(/^\/+|\/+$/g, '');
-    if (clean !== '') {
-      const file = flat.get(clean);
-      if (file !== undefined) {
-        const blob = getObject(file.oid);
-        const data = blob?.data ?? Buffer.alloc(0);
-        sendJson(res, 200, {
-          type: 'file',
-          encoding: 'base64',
-          content: data.toString('base64'),
-          sha: file.oid,
-          size: data.length,
-          name: clean.split('/').pop(),
-          path: clean,
-        });
-        return;
-      }
-    }
-    // A directory (or the root): list its immediate entries.
-    const prefix = clean === '' ? '' : `${clean}/`;
-    const entries = new Map<string, { type: string; oid: string; size: number }>();
-    let dirExists = clean === '';
-    for (const [filePath, entry] of flat) {
-      if (prefix !== '' && !filePath.startsWith(prefix)) continue;
-      dirExists = true;
-      const rest = filePath.slice(prefix.length);
-      const slash = rest.indexOf('/');
-      if (slash === -1) {
-        const blob = getObject(entry.oid);
-        entries.set(rest, { type: 'file', oid: entry.oid, size: blob?.data.length ?? 0 });
-      } else {
-        const dirName = rest.slice(0, slash);
-        if (!entries.has(dirName)) {
-          const subTree = treeOidAtPath(tip, prefix + dirName);
-          entries.set(dirName, { type: 'dir', oid: subTree ?? ZERO_OID, size: 0 });
-        }
-      }
-    }
-    if (!dirExists) {
-      notFound(res);
-      return;
-    }
-    const list = [...entries.entries()]
-      .sort((a, b) => (a[0] < b[0] ? -1 : 1))
-      .map(([name, entry]) => ({
-        type: entry.type,
-        name,
-        path: prefix + name,
-        sha: entry.oid,
-        size: entry.size,
-      }));
-    sendJson(res, 200, list);
+    sendError(store, res, 404, 'Not Found');
     return;
   }
-  if (method === 'PUT' || method === 'DELETE') {
-    const parsed = jsonBody(info, res);
-    if (parsed === BAD_JSON) return;
-    const body = asRecord(parsed);
-    const message = strField(body, 'message') ?? (method === 'PUT' ? 'add file' : 'delete file');
-    const branch = strField(body, 'branch');
-    const { ref, tip } = branchTip(repo, branch);
-    if (branch !== undefined && tip === null && !(branch === repo.defaultBranch)) {
-      sendJson(res, 404, { message: 'Branch not found' });
-      return;
-    }
-    const flat = tip === null ? new Map<string, FlatEntry>() : flatMapOfCommit(tip);
-    const clean = path.replace(/^\/+/, '');
-    const existing = flat.get(clean);
-    if (method === 'PUT') {
-      const contentB64 = strField(body, 'content');
-      if (contentB64 === undefined) {
-        sendJson(res, 422, { message: 'content is required' });
-        return;
-      }
-      const shaGiven = strField(body, 'sha');
-      if (existing !== undefined) {
-        if (shaGiven === undefined) {
-          sendJson(res, 422, { message: 'sha is required when updating a file' });
-          return;
-        }
-        if (shaGiven !== existing.oid) {
-          sendJson(res, 409, { message: 'The supplied sha does not match the current file' });
-          return;
-        }
-      }
-      const data = Buffer.from(contentB64, 'base64');
-      const blobOid = storeObject('blob', data);
-      flat.set(clean, { mode: '100644', oid: blobOid });
-      const tree = storeTreeFromFlat(flat);
-      const commitSha = makeCommit(tree, tip === null ? [] : [tip], message);
-      repo.refs.set(ref, commitSha);
-      sendJson(res, existing === undefined ? 201 : 200, {
-        content: {
-          type: 'file',
-          encoding: 'base64',
-          sha: blobOid,
-          size: data.length,
-          name: clean.split('/').pop(),
-          path: clean,
-        },
-        commit: { sha: commitSha, message },
+
+  if (segments[0] === 'meta' && segments.length === 1) {
+    if (method === 'GET') {
+      sendJson(store, res, 200, {
+        installed_version: `forge-${FORGE_VERSION}`,
+        git_version: 'forge',
+        verifiable_password_authentication: false,
       });
       return;
     }
-    // DELETE
-    if (existing === undefined) {
-      notFound(res);
-      return;
-    }
-    const shaGiven = strField(body, 'sha');
-    if (shaGiven !== undefined && shaGiven !== existing.oid) {
-      sendJson(res, 409, { message: 'The supplied sha does not match the current file' });
-      return;
-    }
-    flat.delete(clean);
-    const tree = storeTreeFromFlat(flat);
-    const commitSha = makeCommit(tree, tip === null ? [] : [tip], message);
-    repo.refs.set(ref, commitSha);
-    sendJson(res, 200, { content: null, commit: { sha: commitSha, message } });
+    sendError(store, res, 404, 'Not Found');
     return;
   }
-  notFound(res);
-}
 
-/** The tree id at a directory path inside a commit, or null. */
-function treeOidAtPath(commitOid: string, dirPath: string): string | null {
-  const commit = getObject(commitOid);
-  if (commit === undefined || commit.type !== 'commit') return null;
-  let current = parseCommit(commit.data).tree;
-  for (const part of dirPath.split('/').filter((part) => part !== '')) {
-    const tree = getObject(current);
-    if (tree === undefined || tree.type !== 'tree') return null;
-    const entry = parseTree(tree.data).find((candidate) => candidate.name === part && candidate.mode === '40000');
-    if (entry === undefined) return null;
-    current = entry.oid;
-  }
-  return current;
-}
-
-function handleRest(info: ReqInfo, res: ServerResponse): void {
-  const seg = info.segments;
-  // seg: ['api', 'v3', ...]
-  const rest = seg.slice(2);
-  if (rest.length === 0 || (rest.length === 1 && rest[0] === '')) {
-    if (info.method === 'GET') {
-      sendJson(
-        res,
-        200,
-        {
-          current_user_url: '/api/v3/user',
-          repository_url: '/api/v3/repos/{owner}/{repo}',
-          issue_search_url: '/api/v3/search/issues',
-          rate_limit_url: '/api/v3/rate_limit',
-        },
-        { 'x-oauth-scopes': 'repo, read:org', 'x-accepted-oauth-scopes': 'repo' },
-      );
-      return;
-    }
-    notFound(res);
-    return;
-  }
-  if (!authed(info)) {
-    sendJson(res, 401, { message: 'Requires authentication' });
-    return;
-  }
-  if (rest[0] === 'meta' && info.method === 'GET') {
-    sendJson(res, 200, { installed_version: '1.0.0-forge', verifiable_password_authentication: false });
-    return;
-  }
-  if (rest[0] === 'user' && rest[1] === 'repos') {
-    if (info.method === 'GET') {
-      const all = [...state.repos.values()].sort((a, b) => a.seq - b.seq).map((repo) => repoJson(repo));
-      sendJson(res, 200, paginate(info, res, all, '/api/v3/user/repos'));
-      return;
-    }
-    if (info.method === 'POST') {
-      const parsed = jsonBody(info, res);
-      if (parsed === BAD_JSON) return;
-      const body = asRecord(parsed);
-      const name = strField(body, 'name');
-      if (name === undefined || name === '') {
-        sendJson(res, 422, { message: 'name is required' });
-        return;
-      }
-      if (state.repos.has(name.toLowerCase())) {
-        sendJson(res, 422, { message: 'name already exists on this account' });
-        return;
-      }
-      const repo = createRepo(name, strField(body, 'description') ?? null, body.private === true);
-      sendJson(res, 201, repoJson(repo));
-      return;
-    }
-    notFound(res);
-    return;
-  }
-  if (rest[0] === 'user' && info.method === 'GET') {
-    sendJson(res, 200, { login: viewerLogin(), id: 1000, type: 'User' });
-    return;
-  }
-  if (rest[0] !== 'repos' || rest.length < 3) {
-    notFound(res);
-    return;
-  }
-  const owner = rest[1] as string;
-  const repoName = rest[2] as string;
-  const repo = findRepo(owner, repoName);
-  if (repo === null) {
-    notFound(res);
-    return;
-  }
-  const tail = rest.slice(3);
-  handleRepoRoutes(info, res, repo, tail);
-}
-
-function handleRepoRoutes(info: ReqInfo, res: ServerResponse, repo: RepoRec, tail: string[]): void {
-  const method = info.method;
-  if (tail.length === 0) {
+  if (segments[0] === 'user' && segments.length === 1) {
     if (method === 'GET') {
-      sendJson(res, 200, repoJson(repo));
+      sendJson(store, res, 200, {
+        ...userJson(VIEWER_LOGIN),
+        name: VIEWER_NAME,
+        email: VIEWER_EMAIL,
+        bio: '',
+        company: '',
+        location: '',
+        followers: 0,
+        following: 0,
+        public_repos: [...store.repos.values()].filter((repo) => repo.owner === VIEWER_LOGIN).length,
+      });
+      return;
+    }
+    sendError(store, res, 404, 'Not Found');
+    return;
+  }
+
+  if (segments[0] === 'user' && segments[1] === 'repos' && segments.length === 2) {
+    if (method === 'POST') {
+      const name = typeof body.name === 'string' ? body.name : '';
+      if (name === '') {
+        sendError(store, res, 422, 'name is required');
+        return;
+      }
+      if (findRepo(store, VIEWER_LOGIN, name)) {
+        sendError(store, res, 422, 'Repository already exists');
+        return;
+      }
+      const repo = createRepoRec(
+        store,
+        VIEWER_LOGIN,
+        name,
+        typeof body.description === 'string' ? body.description : '',
+        body.private === true,
+      );
+      sendJson(store, res, 201, repoJson(repo));
+      return;
+    }
+    if (method === 'GET') {
+      const { perPage, page } = paginationParams(ctx.url);
+      const mine = [...store.repos.values()]
+        .filter((repo) => repo.owner === VIEWER_LOGIN)
+        .sort((a, b) => a.createdSeq - b.createdSeq);
+      const totalPages = Math.max(1, Math.ceil(mine.length / perPage));
+      const slice = mine.slice((page - 1) * perPage, page * perPage);
+      const headers: Record<string, string> = {};
+      if (page < totalPages) {
+        const base = `${originOf(req)}/api/v3/user/repos`;
+        headers['Link'] =
+          `<${base}?per_page=${perPage}&page=${page + 1}>; rel="next", ` +
+          `<${base}?per_page=${perPage}&page=${totalPages}>; rel="last"`;
+      }
+      sendJson(store, res, 200, slice.map(repoJson), headers);
+      return;
+    }
+    sendError(store, res, 404, 'Not Found');
+    return;
+  }
+
+  if (segments[0] === 'repos' && segments.length >= 3) {
+    const owner = segments[1];
+    const name = segments[2];
+    const repo = findRepo(store, owner, name);
+    if (!repo) {
+      sendError(store, res, 404, 'Not Found');
+      return;
+    }
+    routeRepoScoped(ctx, res, repo, segments.slice(3), body);
+    return;
+  }
+
+  sendError(store, res, 404, 'Not Found');
+}
+
+function routeRepoScoped(
+  ctx: RequestContext,
+  res: ServerResponse,
+  repo: RepoRec,
+  rest: string[],
+  body: Record<string, unknown>,
+): void {
+  const { store, req } = ctx;
+  const method = (req.method ?? 'GET').toUpperCase();
+
+  if (rest.length === 0) {
+    if (method === 'GET') {
+      sendJson(store, res, 200, repoJson(repo));
       return;
     }
     if (method === 'PATCH') {
-      const parsed = jsonBody(info, res);
-      if (parsed === BAD_JSON) return;
-      const body = asRecord(parsed);
-      const description = strField(body, 'description');
-      if (description !== undefined) repo.description = description;
-      const name = strField(body, 'name');
-      if (name !== undefined && name !== repo.name) {
-        state.repos.delete(repo.name.toLowerCase());
-        repo.name = name;
-        state.repos.set(name.toLowerCase(), repo);
-      }
+      if (typeof body.description === 'string') repo.description = body.description;
       if (typeof body.private === 'boolean') repo.isPrivate = body.private;
-      sendJson(res, 200, repoJson(repo));
+      sendJson(store, res, 200, repoJson(repo));
       return;
     }
     if (method === 'DELETE') {
-      state.repos.delete(repo.name.toLowerCase());
-      sendJson(res, 204, undefined);
+      store.repos.delete(repoKey(repo.owner, repo.name));
+      store.requestSeq += 1;
+      res.writeHead(204, { 'X-GitHub-Request-Id': `forge-${store.requestSeq}` });
+      res.end();
       return;
     }
-    notFound(res);
+    sendError(store, res, 404, 'Not Found');
     return;
   }
-  if (tail[0] === 'contents') {
-    handleContents(info, res, repo, tail.slice(1).join('/'));
-    return;
-  }
-  if (tail[0] === 'branches' && method === 'GET') {
-    const branches: Array<Record<string, unknown>> = [];
-    for (const [ref, oid] of repo.refs) {
-      if (!ref.startsWith('refs/heads/')) continue;
-      branches.push({ name: ref.slice('refs/heads/'.length), commit: { sha: oid }, protected: false });
-    }
-    branches.sort((a, b) => String(a.name).localeCompare(String(b.name)));
-    sendJson(res, 200, branches);
-    return;
-  }
-  if (tail[0] === 'git' && tail[1] === 'refs' && method === 'POST') {
-    const parsed = jsonBody(info, res);
-    if (parsed === BAD_JSON) return;
-    const body = asRecord(parsed);
-    const ref = strField(body, 'ref');
-    const sha = strField(body, 'sha');
-    if (ref === undefined || sha === undefined || !ref.startsWith('refs/')) {
-      sendJson(res, 422, { message: 'ref and sha are required' });
-      return;
-    }
-    if (repo.refs.has(ref)) {
-      sendJson(res, 422, { message: 'Reference already exists' });
-      return;
-    }
-    const target = getObject(sha);
-    if (target === undefined) {
-      sendJson(res, 422, { message: 'The sha does not name an object in this repository' });
-      return;
-    }
-    repo.refs.set(ref, sha);
-    sendJson(res, 201, { ref, object: { sha, type: target.type } });
-    return;
-  }
-  if (tail[0] === 'commits' && method === 'GET') {
-    const shaParam = info.query.get('sha') ?? undefined;
-    let tip: string | null;
-    if (shaParam !== undefined && isOid(shaParam) && getObject(shaParam)?.type === 'commit') tip = shaParam;
-    else tip = branchTip(repo, shaParam).tip;
-    if (tip === null) {
-      sendJson(res, 200, []);
-      return;
-    }
-    const commits = listCommitsFrom(tip).map((oid) => {
-      const obj = getObject(oid) as StoredObject;
-      const parsedCommit = parseCommit(obj.data);
-      return {
-        sha: oid,
-        commit: {
-          message: parsedCommit.message,
-          tree: { sha: parsedCommit.tree },
-          author: { name: 'Forge Bot', email: 'forge@localhost', date: isoOf(parsedCommit.committerTime || 1767225600) },
-          committer: { name: 'Forge Bot', email: 'forge@localhost', date: isoOf(parsedCommit.committerTime || 1767225600) },
-        },
-        parents: parsedCommit.parents.map((parent) => ({ sha: parent })),
-      };
-    });
-    sendJson(res, 200, paginate(info, res, commits, `/api/v3/repos/${viewerLogin()}/${repo.name}/commits`));
-    return;
-  }
-  if (tail[0] === 'labels') {
-    if (method === 'POST') {
-      const parsed = jsonBody(info, res);
-      if (parsed === BAD_JSON) return;
-      const body = asRecord(parsed);
-      const name = strField(body, 'name');
-      if (name === undefined || name === '') {
-        sendJson(res, 422, { message: 'name is required' });
+
+  if (rest[0] === 'labels') {
+    if (method === 'POST' && rest.length === 1) {
+      const name = typeof body.name === 'string' ? body.name : '';
+      if (name === '') {
+        sendError(store, res, 422, 'name is required');
         return;
       }
-      if (repo.labels.has(name)) {
-        sendJson(res, 422, { message: 'Label already exists' });
+      const existing = repo.labels.get(name);
+      if (existing) {
+        sendJson(store, res, 201, labelJson(existing));
         return;
       }
       const label: LabelRec = {
         name,
-        color: (strField(body, 'color') ?? 'ededed').replace(/^#/, ''),
-        description: strField(body, 'description') ?? null,
+        color: typeof body.color === 'string' ? body.color : 'ededed',
       };
       repo.labels.set(name, label);
-      sendJson(res, 201, labelJson(label));
+      sendJson(store, res, 201, labelJson(label));
       return;
     }
-    if (method === 'GET' && tail.length === 1) {
-      sendJson(res, 200, [...repo.labels.values()].map((label) => labelJson(label)));
+    if (method === 'GET' && rest.length === 1) {
+      sendJson(store, res, 200, [...repo.labels.values()].map(labelJson));
       return;
     }
-    notFound(res);
+    sendError(store, res, 404, 'Not Found');
     return;
   }
-  if (tail[0] === 'issues') {
-    handleIssues(info, res, repo, tail.slice(1));
-    return;
-  }
-  if (tail[0] === 'pulls') {
-    handlePulls(info, res, repo, tail.slice(1));
-    return;
-  }
-  notFound(res);
-}
 
-function handleIssues(info: ReqInfo, res: ServerResponse, repo: RepoRec, tail: string[]): void {
-  const method = info.method;
-  if (tail.length === 0) {
-    if (method === 'POST') {
-      const parsed = jsonBody(info, res);
-      if (parsed === BAD_JSON) return;
-      const body = asRecord(parsed);
-      const title = strField(body, 'title');
-      if (title === undefined || title === '') {
-        sendJson(res, 422, { message: 'title is required' });
-        return;
-      }
-      const labelNames: string[] = [];
-      if (Array.isArray(body.labels)) {
-        for (const raw of body.labels) {
-          const name = typeof raw === 'string' ? raw : strField(asRecord(raw), 'name');
-          if (name === undefined) continue;
-          if (!repo.labels.has(name)) {
-            sendJson(res, 422, { message: `Label "${name}" does not exist in this repository` });
-            return;
-          }
-          labelNames.push(name);
-        }
-      }
-      const issue = createIssueRec(repo, title, strField(body, 'body') ?? '', labelNames);
-      sendJson(res, 201, issueJson(repo, issue));
-      return;
-    }
-    if (method === 'GET') {
-      const stateFilter = info.query.get('state') ?? 'open';
-      let issues = [...repo.issues.values()];
-      if (stateFilter === 'open') issues = issues.filter((issue) => issue.state === 'open');
-      else if (stateFilter === 'closed') issues = issues.filter((issue) => issue.state === 'closed');
-      const direction = info.query.get('direction') ?? 'desc';
-      issues.sort((a, b) => (direction === 'asc' ? a.number - b.number : b.number - a.number));
-      const rendered = issues.map((issue) => issueJson(repo, issue));
-      sendJson(res, 200, paginate(info, res, rendered, `/api/v3/repos/${viewerLogin()}/${repo.name}/issues`));
-      return;
-    }
-    notFound(res);
+  if (rest[0] === 'issues') {
+    routeIssues(ctx, res, repo, rest.slice(1), body);
     return;
   }
-  const number = Number(tail[0]);
-  const issue = Number.isInteger(number) ? repo.issues.get(number) : undefined;
-  if (tail.length === 1) {
-    if (issue === undefined) {
-      notFound(res);
-      return;
-    }
-    if (method === 'GET') {
-      sendJson(res, 200, issueJson(repo, issue));
-      return;
-    }
-    if (method === 'PATCH') {
-      const parsed = jsonBody(info, res);
-      if (parsed === BAD_JSON) return;
-      const body = asRecord(parsed);
-      const newState = strField(body, 'state');
-      if (newState === 'open' || newState === 'closed') issue.state = newState;
-      const newTitle = strField(body, 'title');
-      if (newTitle !== undefined) issue.title = newTitle;
-      const newBody = strField(body, 'body');
-      if (newBody !== undefined) issue.body = newBody;
-      sendJson(res, 200, issueJson(repo, issue));
-      return;
-    }
-    notFound(res);
+
+  if (rest[0] === 'pulls') {
+    routePulls(ctx, res, repo, rest.slice(1), body);
     return;
   }
-  if (tail[1] === 'comments') {
-    if (issue === undefined) {
-      notFound(res);
-      return;
-    }
-    if (method === 'POST') {
-      const parsed = jsonBody(info, res);
-      if (parsed === BAD_JSON) return;
-      const body = asRecord(parsed);
-      const text = strField(body, 'body');
-      if (text === undefined) {
-        sendJson(res, 422, { message: 'body is required' });
+
+  if (rest[0] === 'git' && rest[1] === 'refs') {
+    if (method === 'POST' && rest.length === 2) {
+      const ref = typeof body.ref === 'string' ? body.ref : '';
+      const sha = typeof body.sha === 'string' ? body.sha : '';
+      if (!ref.startsWith('refs/') || !isOid(sha) || !getObject(repo, sha)) {
+        sendError(store, res, 422, 'Invalid ref or object');
         return;
       }
-      state.dbSeq += 1;
-      const comment: CommentRec = { dbId: state.dbSeq, body: text, seq: ++state.repoSeq };
-      issue.comments.push(comment);
-      sendJson(res, 201, {
-        id: comment.dbId,
-        body: comment.body,
-        user: { login: viewerLogin(), id: 1000, type: 'User' },
-        created_at: isoOf(1767225600 + comment.seq * 61),
-        updated_at: isoOf(1767225600 + comment.seq * 61),
+      repo.refs.set(ref, sha);
+      const object = getObject(repo, sha) as GitObject;
+      sendJson(store, res, 201, { ref, node_id: `ref-${ref}`, object: { sha, type: object.type } });
+      return;
+    }
+    if (method === 'GET' && rest.length >= 4 && rest[2] === 'heads') {
+      const branch = rest.slice(3).join('/');
+      const tip = branchTip(repo, branch);
+      if (!tip) {
+        sendError(store, res, 404, 'Not Found');
+        return;
+      }
+      sendJson(store, res, 200, {
+        ref: `refs/heads/${branch}`,
+        node_id: `ref-heads-${branch}`,
+        object: { sha: tip, type: 'commit' },
       });
       return;
     }
-    if (method === 'GET') {
-      sendJson(
-        res,
-        200,
-        issue.comments.map((comment) => ({
-          id: comment.dbId,
-          body: comment.body,
-          user: { login: viewerLogin(), id: 1000, type: 'User' },
-          created_at: isoOf(1767225600 + comment.seq * 61),
-          updated_at: isoOf(1767225600 + comment.seq * 61),
-        })),
-      );
-      return;
-    }
-    notFound(res);
+    sendError(store, res, 404, 'Not Found');
     return;
   }
-  notFound(res);
-}
 
-function handlePulls(info: ReqInfo, res: ServerResponse, repo: RepoRec, tail: string[]): void {
-  const method = info.method;
-  const stripOwnerPrefix = (ref: string): string => {
-    const colon = ref.indexOf(':');
-    return colon === -1 ? ref : ref.slice(colon + 1);
-  };
-  if (tail.length === 0) {
-    if (method === 'POST') {
-      const parsed = jsonBody(info, res);
-      if (parsed === BAD_JSON) return;
-      const body = asRecord(parsed);
-      const title = strField(body, 'title');
-      const head = strField(body, 'head');
-      const base = strField(body, 'base');
-      if (title === undefined || head === undefined || base === undefined) {
-        sendJson(res, 422, { message: 'title, head and base are required' });
+  if (rest[0] === 'branches') {
+    if (method === 'GET' && rest.length === 1) {
+      const branches = [...repo.refs.entries()]
+        .filter(([ref]) => ref.startsWith('refs/heads/'))
+        .map(([ref, sha]) => ({ name: ref.slice('refs/heads/'.length), commit: { sha }, protected: false }))
+        .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+      sendJson(store, res, 200, branches);
+      return;
+    }
+    if (method === 'GET' && rest.length >= 2) {
+      const branch = rest.slice(1).join('/');
+      const tip = branchTip(repo, branch);
+      if (!tip) {
+        sendError(store, res, 404, 'Not Found');
         return;
       }
-      const headRef = stripOwnerPrefix(head);
-      const baseRef = stripOwnerPrefix(base);
-      if (refSha(repo, headRef) === null) {
-        sendJson(res, 422, { message: `Head branch "${headRef}" does not exist` });
+      sendJson(store, res, 200, { name: branch, commit: { sha: tip }, protected: false });
+      return;
+    }
+    sendError(store, res, 404, 'Not Found');
+    return;
+  }
+
+  if (rest[0] === 'commits') {
+    if (method === 'GET' && rest.length === 1) {
+      const shaParam = ctx.url.searchParams.get('sha') ?? repo.defaultBranch;
+      const start = branchTip(repo, shaParam) ?? (isOid(shaParam) ? resolveCommit(repo, shaParam) : undefined);
+      if (!start) {
+        sendError(store, res, 404, 'Not Found');
         return;
       }
-      if (refSha(repo, baseRef) === null) {
-        sendJson(res, 422, { message: `Base branch "${baseRef}" does not exist` });
-        return;
-      }
-      for (const existing of repo.pulls.values()) {
-        if (existing.state === 'open' && existing.headRef === headRef && existing.baseRef === baseRef) {
-          sendJson(res, 422, { message: 'A pull request already exists for this head and base' });
-          return;
+      const { perPage } = paginationParams(ctx.url);
+      const ordered: string[] = [];
+      const seen = new Set<string>();
+      const stack = [start];
+      while (stack.length > 0 && ordered.length < perPage) {
+        const current = stack.pop() as string;
+        if (seen.has(current)) continue;
+        seen.add(current);
+        ordered.push(current);
+        const object = getObject(repo, current);
+        if (object && object.type === 'commit') {
+          const parents = parseCommit(object.data).parents;
+          for (let i = parents.length - 1; i >= 0; i--) stack.push(parents[i]);
         }
       }
-      const pull = createPullRec(repo, title, strField(body, 'body') ?? '', headRef, baseRef);
-      sendJson(res, 201, pullJson(repo, pull));
+      sendJson(store, res, 200, ordered.map((oid) => commitJson(repo, oid)));
+      return;
+    }
+    if (method === 'GET' && rest.length === 2 && isOid(rest[1]) && getObject(repo, rest[1])?.type === 'commit') {
+      sendJson(store, res, 200, commitJson(repo, rest[1]));
+      return;
+    }
+    sendError(store, res, 404, 'Not Found');
+    return;
+  }
+
+  if (rest[0] === 'contents') {
+    routeContents(ctx, res, repo, rest.slice(1).join('/'), body);
+    return;
+  }
+
+  sendError(store, res, 404, 'Not Found');
+}
+
+function routeIssues(
+  ctx: RequestContext,
+  res: ServerResponse,
+  repo: RepoRec,
+  rest: string[],
+  body: Record<string, unknown>,
+): void {
+  const { store, req } = ctx;
+  const method = (req.method ?? 'GET').toUpperCase();
+
+  if (rest.length === 0) {
+    if (method === 'POST') {
+      const title = typeof body.title === 'string' ? body.title : '';
+      if (title === '') {
+        sendError(store, res, 422, 'title is required');
+        return;
+      }
+      const rawLabels = Array.isArray(body.labels) ? body.labels : [];
+      const labels: string[] = [];
+      for (const raw of rawLabels) {
+        const labelName = typeof raw === 'string' ? raw : (raw as { name?: unknown })?.name;
+        if (typeof labelName !== 'string' || !repo.labels.has(labelName)) {
+          sendError(store, res, 422, `Unknown label: ${String(labelName)}`);
+          return;
+        }
+        labels.push(labelName);
+      }
+      const issue = createIssueRec(
+        store,
+        repo,
+        title,
+        typeof body.body === 'string' ? body.body : '',
+        labels,
+      );
+      sendJson(store, res, 201, issueJson(repo, issue));
       return;
     }
     if (method === 'GET') {
-      const stateFilter = info.query.get('state') ?? 'open';
-      let pulls = [...repo.pulls.values()];
-      if (stateFilter === 'open') pulls = pulls.filter((pull) => pull.state === 'open');
-      else if (stateFilter === 'closed') pulls = pulls.filter((pull) => pull.state === 'closed');
-      pulls.sort((a, b) => b.number - a.number);
-      const rendered = pulls.map((pull) => pullJson(repo, pull));
-      sendJson(res, 200, paginate(info, res, rendered, `/api/v3/repos/${viewerLogin()}/${repo.name}/pulls`));
+      const stateParam = ctx.url.searchParams.get('state') ?? 'open';
+      const direction = ctx.url.searchParams.get('direction') ?? 'desc';
+      const { perPage, page } = paginationParams(ctx.url);
+      let list = [...repo.issues.values()];
+      if (stateParam === 'open' || stateParam === 'closed') {
+        list = list.filter((issue) => issue.state === stateParam);
+      }
+      list.sort((a, b) => (direction === 'asc' ? a.createdSeq - b.createdSeq : b.createdSeq - a.createdSeq));
+      const slice = list.slice((page - 1) * perPage, page * perPage);
+      sendJson(store, res, 200, slice.map((issue) => issueJson(repo, issue)));
       return;
     }
-    notFound(res);
+    sendError(store, res, 404, 'Not Found');
     return;
   }
-  const number = Number(tail[0]);
+
+  const number = Number(rest[0]);
+  const issue = Number.isInteger(number) ? repo.issues.get(number) : undefined;
+
+  if (rest.length === 1) {
+    if (!issue) {
+      sendError(store, res, 404, 'Not Found');
+      return;
+    }
+    if (method === 'GET') {
+      sendJson(store, res, 200, issueJson(repo, issue));
+      return;
+    }
+    if (method === 'PATCH') {
+      if (body.state === 'open' || body.state === 'closed') issue.state = body.state;
+      if (typeof body.title === 'string') issue.title = body.title;
+      if (typeof body.body === 'string') issue.body = body.body;
+      if (Array.isArray(body.labels)) {
+        const labels: string[] = [];
+        for (const raw of body.labels) {
+          const labelName = typeof raw === 'string' ? raw : (raw as { name?: unknown })?.name;
+          if (typeof labelName !== 'string' || !repo.labels.has(labelName)) {
+            sendError(store, res, 422, `Unknown label: ${String(labelName)}`);
+            return;
+          }
+          labels.push(labelName);
+        }
+        issue.labels = labels;
+      }
+      sendJson(store, res, 200, issueJson(repo, issue));
+      return;
+    }
+    sendError(store, res, 404, 'Not Found');
+    return;
+  }
+
+  if (rest.length === 2 && rest[1] === 'comments') {
+    if (!issue) {
+      sendError(store, res, 404, 'Not Found');
+      return;
+    }
+    if (method === 'POST') {
+      const comment: CommentRec = {
+        id: store.nextCommentId++,
+        body: typeof body.body === 'string' ? body.body : '',
+        author: VIEWER_LOGIN,
+        createdSeq: store.clockSeq + 1,
+      };
+      tickIso(store);
+      issue.comments.push(comment);
+      sendJson(store, res, 201, commentJson(comment));
+      return;
+    }
+    if (method === 'GET') {
+      sendJson(store, res, 200, issue.comments.map(commentJson));
+      return;
+    }
+    sendError(store, res, 404, 'Not Found');
+    return;
+  }
+
+  sendError(store, res, 404, 'Not Found');
+}
+
+function stripOwnerPrefix(ref: string): string {
+  const colon = ref.indexOf(':');
+  return colon === -1 ? ref : ref.slice(colon + 1);
+}
+
+function routePulls(
+  ctx: RequestContext,
+  res: ServerResponse,
+  repo: RepoRec,
+  rest: string[],
+  body: Record<string, unknown>,
+): void {
+  const { store, req } = ctx;
+  const method = (req.method ?? 'GET').toUpperCase();
+
+  if (rest.length === 0) {
+    if (method === 'POST') {
+      const title = typeof body.title === 'string' ? body.title : '';
+      const head = stripOwnerPrefix(typeof body.head === 'string' ? body.head : '');
+      const base = stripOwnerPrefix(typeof body.base === 'string' ? body.base : '');
+      if (!branchTip(repo, head)) {
+        sendError(store, res, 422, `head branch not found: ${head}`);
+        return;
+      }
+      if (!branchTip(repo, base)) {
+        sendError(store, res, 422, `base branch not found: ${base}`);
+        return;
+      }
+      const duplicate = [...repo.pulls.values()].find(
+        (pull) => pull.state === 'open' && pull.headRef === head && pull.baseRef === base,
+      );
+      if (duplicate) {
+        sendError(store, res, 422, `A pull request already exists for ${head} into ${base}`);
+        return;
+      }
+      const pull = createPullRec(store, repo, title, typeof body.body === 'string' ? body.body : '', head, base);
+      sendJson(store, res, 201, pullJson(repo, pull));
+      return;
+    }
+    if (method === 'GET') {
+      const stateParam = ctx.url.searchParams.get('state') ?? 'open';
+      let list = [...repo.pulls.values()];
+      if (stateParam === 'open' || stateParam === 'closed') {
+        list = list.filter((pull) => pull.state === stateParam);
+      }
+      list.sort((a, b) => a.number - b.number);
+      sendJson(store, res, 200, list.map((pull) => pullJson(repo, pull)));
+      return;
+    }
+    sendError(store, res, 404, 'Not Found');
+    return;
+  }
+
+  const number = Number(rest[0]);
   const pull = Number.isInteger(number) ? repo.pulls.get(number) : undefined;
-  if (pull === undefined) {
-    notFound(res);
+  if (!pull) {
+    sendError(store, res, 404, 'Not Found');
     return;
   }
-  if (tail.length === 1 && method === 'GET') {
-    sendJson(res, 200, pullJson(repo, pull));
+
+  if (rest.length === 1 && method === 'GET') {
+    sendJson(store, res, 200, pullJson(repo, pull));
     return;
   }
-  if (tail.length === 2 && tail[1] === 'files' && method === 'GET') {
-    sendJson(res, 200, pullFiles(repo, pull));
-    return;
-  }
-  if (tail.length === 2 && tail[1] === 'merge' && method === 'PUT') {
-    const parsed = info.body.length > 0 ? jsonBody(info, res) : {};
-    if (parsed === BAD_JSON) return;
-    const body = asRecord(parsed);
-    if (pull.merged) {
-      sendJson(res, 405, { message: 'Pull Request has already been merged' });
+
+  if (rest.length === 2 && rest[1] === 'files' && method === 'GET') {
+    const baseTip = branchTip(repo, pull.baseRef);
+    const headTip = branchTip(repo, pull.headRef);
+    if (!baseTip || !headTip) {
+      sendJson(store, res, 200, []);
       return;
     }
-    if (pull.state !== 'open') {
-      sendJson(res, 405, { message: 'Pull Request is not open' });
-      return;
-    }
-    const methodWanted = (strField(body, 'merge_method') ?? 'squash').toLowerCase();
-    const sha = performMerge(repo, pull, methodWanted === 'merge' ? 'merge' : 'squash');
-    if (sha === null) {
-      sendJson(res, 405, { message: 'Pull Request is not mergeable: it has conflicts' });
-      return;
-    }
-    sendJson(res, 200, { sha, merged: true, message: 'Pull Request successfully merged' });
+    const mergeBase = findMergeBase(repo, headTip, baseTip);
+    const fromTree = mergeBase ? commitTreeOid(repo, mergeBase) : '';
+    const changes = diffTrees(repo, fromTree, commitTreeOid(repo, headTip));
+    sendJson(store, res, 200, changes.map((change) => ({
+      filename: change.filename,
+      status: change.status,
+      additions: change.additions,
+      deletions: change.deletions,
+      changes: change.changes,
+      sha: change.sha,
+    })));
     return;
   }
-  notFound(res);
+
+  if (rest.length === 2 && rest[1] === 'merge' && method === 'PUT') {
+    if (pull.merged || pull.state === 'closed') {
+      sendError(store, res, 405, 'Pull Request is not mergeable');
+      return;
+    }
+    const result = executeSquashMerge(store, repo, pull);
+    if (!result.ok) {
+      sendError(store, res, 405, 'Pull Request is not mergeable');
+      return;
+    }
+    sendJson(store, res, 200, {
+      sha: result.sha,
+      merged: true,
+      message: 'Pull Request successfully merged',
+    });
+    return;
+  }
+
+  sendError(store, res, 404, 'Not Found');
+}
+
+function routeContents(
+  ctx: RequestContext,
+  res: ServerResponse,
+  repo: RepoRec,
+  path: string,
+  body: Record<string, unknown>,
+): void {
+  const { store, req } = ctx;
+  const method = (req.method ?? 'GET').toUpperCase();
+
+  if (method === 'GET') {
+    const refParam = ctx.url.searchParams.get('ref') ?? repo.defaultBranch;
+    const commitOid = branchTip(repo, refParam) ?? (isOid(refParam) ? resolveCommit(repo, refParam) : undefined);
+    if (!commitOid) {
+      sendError(store, res, 404, 'Not Found');
+      return;
+    }
+    const read = readPath(repo, commitOid, path);
+    if (!read) {
+      sendError(store, res, 404, 'Not Found');
+      return;
+    }
+    if (read.kind === 'file') {
+      const name = path.split('/').pop() ?? path;
+      sendJson(store, res, 200, {
+        type: 'file',
+        encoding: 'base64',
+        content: read.data.toString('base64'),
+        sha: read.oid,
+        size: read.data.length,
+        name,
+        path,
+        html_url: `https://forge.invalid/${repo.owner}/${repo.name}/blob/${refParam}/${path}`,
+        download_url: `https://forge.invalid/${repo.owner}/${repo.name}/raw/${refParam}/${path}`,
+      });
+      return;
+    }
+    sendJson(store, res, 200, read.entries.map((entry) => ({
+      type: entry.type,
+      name: entry.name,
+      path: entry.path,
+      sha: entry.oid,
+      size: 0,
+    })));
+    return;
+  }
+
+  if (method === 'PUT') {
+    if (path === '') {
+      sendError(store, res, 422, 'path is required');
+      return;
+    }
+    const branch = typeof body.branch === 'string' && body.branch !== '' ? body.branch : repo.defaultBranch;
+    const content = Buffer.from(typeof body.content === 'string' ? body.content : '', 'base64');
+    const message = typeof body.message === 'string' ? body.message : `Update ${path}`;
+    const tip = branchTip(repo, branch);
+    let flat = new Map<string, { oid: string; mode: string }>();
+    if (tip) flat = flattenTree(repo, commitTreeOid(repo, tip));
+    const existing = flat.get(path);
+    const shaParam = typeof body.sha === 'string' && body.sha !== '' ? body.sha : undefined;
+    if (shaParam !== undefined) {
+      if (!existing) {
+        sendError(store, res, 422, 'sha supplied but the file does not exist');
+        return;
+      }
+      if (existing.oid !== shaParam) {
+        sendError(store, res, 409, 'The supplied sha does not match the current file');
+        return;
+      }
+    }
+    const blobOid = putObject(repo, 'blob', content);
+    flat.set(path, { oid: blobOid, mode: existing?.mode ?? '100644' });
+    const treeOid = buildTreeFromFlat(repo, flat);
+    const commitOid = makeCommit(store, repo, treeOid, tip ? [tip] : [], message);
+    repo.refs.set(`refs/heads/${branch}`, commitOid);
+    const name = path.split('/').pop() ?? path;
+    sendJson(store, res, existing ? 200 : 201, {
+      content: {
+        type: 'file',
+        encoding: 'base64',
+        sha: blobOid,
+        size: content.length,
+        name,
+        path,
+      },
+      commit: {
+        sha: commitOid,
+        message,
+        author: { name: VIEWER_NAME, email: VIEWER_EMAIL },
+        committer: { name: VIEWER_NAME, email: VIEWER_EMAIL },
+      },
+    });
+    return;
+  }
+
+  if (method === 'DELETE') {
+    const branch = typeof body.branch === 'string' && body.branch !== '' ? body.branch : repo.defaultBranch;
+    const tip = branchTip(repo, branch);
+    if (!tip) {
+      sendError(store, res, 404, 'Not Found');
+      return;
+    }
+    const flat = flattenTree(repo, commitTreeOid(repo, tip));
+    const existing = flat.get(path);
+    if (!existing) {
+      sendError(store, res, 404, 'Not Found');
+      return;
+    }
+    const shaParam = typeof body.sha === 'string' && body.sha !== '' ? body.sha : undefined;
+    if (shaParam !== undefined && shaParam !== existing.oid) {
+      sendError(store, res, 409, 'The supplied sha does not match the current file');
+      return;
+    }
+    flat.delete(path);
+    const treeOid = buildTreeFromFlat(repo, flat);
+    const message = typeof body.message === 'string' ? body.message : `Delete ${path}`;
+    const commitOid = makeCommit(store, repo, treeOid, [tip], message);
+    repo.refs.set(`refs/heads/${branch}`, commitOid);
+    sendJson(store, res, 200, {
+      content: null,
+      commit: {
+        sha: commitOid,
+        message,
+        author: { name: VIEWER_NAME, email: VIEWER_EMAIL },
+        committer: { name: VIEWER_NAME, email: VIEWER_EMAIL },
+      },
+    });
+    return;
+  }
+
+  sendError(store, res, 404, 'Not Found');
 }
 
 // ---------------------------------------------------------------------------
-// git smart HTTP
+// Git smart HTTP.
+// ---------------------------------------------------------------------------
 
-const AGENT = 'git/forge-1.0';
-const UPLOAD_CAPS_V0 = `side-band-64k ofs-delta thin-pack shallow symref=HEAD:refs/heads/main agent=${AGENT}`;
-const RECEIVE_CAPS_V0 = `report-status side-band-64k delete-refs ofs-delta agent=${AGENT}`;
+const UPLOAD_CAPS = 'side-band-64k ofs-delta thin-pack symref=HEAD:refs/heads/main agent=forge/1.0';
+const RECEIVE_CAPS = 'report-status delete-refs side-band-64k ofs-delta agent=forge/1.0';
 
-/** Every advertised ref of a repo, sorted, with HEAD first (pointing at the default branch). */
-function advertisedRefs(repo: RepoRec): Array<{ oid: string; name: string; peeled?: string }> {
-  const refs: Array<{ oid: string; name: string; peeled?: string }> = [];
-  const headTarget = `refs/heads/${repo.defaultBranch}`;
-  const headOid = repo.refs.get(headTarget);
-  if (headOid !== undefined) refs.push({ oid: headOid, name: 'HEAD' });
-  const names = [...repo.refs.keys()].sort();
-  for (const name of names) {
-    const oid = repo.refs.get(name) as string;
-    const entry: { oid: string; name: string; peeled?: string } = { oid, name };
-    const obj = getObject(oid);
-    if (obj !== undefined && obj.type === 'tag') {
-      entry.peeled = peelToCommit(oid);
-    }
-    refs.push(entry);
-  }
-  return refs;
+function sortedRefs(repo: RepoRec): [string, string][] {
+  return [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
 }
 
-function handleInfoRefs(info: ReqInfo, res: ServerResponse, repo: RepoRec, service: string): void {
-  const isUpload = service === 'git-upload-pack';
-  const wantsV2 = isUpload && (info.headers['git-protocol'] ?? '') === 'version=2';
-  if (wantsV2) {
-    const body = pktEncode([
-      'version 2\n',
-      `agent=${AGENT}\n`,
-      'ls-refs=unborn\n',
-      'fetch=shallow thin-pack ofs-delta\n',
-      'object-format=sha1\n',
-      'flush',
+function refAdvertisement(repo: RepoRec, capabilities: string): Buffer {
+  const lines: Buffer[] = [];
+  const refs = sortedRefs(repo);
+  const headTip = repo.refs.get(repo.headRef);
+  if (refs.length === 0) {
+    lines.push(pktLine(`${ZERO_OID} capabilities^{}\0${capabilities}\n`));
+  } else {
+    let first = true;
+    const suffix = () => {
+      if (!first) return '';
+      first = false;
+      return `\0${capabilities}`;
+    };
+    if (headTip) lines.push(pktLine(`${headTip} HEAD${suffix()}\n`));
+    for (const [ref, oid] of refs) {
+      lines.push(pktLine(`${oid} ${ref}${suffix()}\n`));
+      const object = getObject(repo, oid);
+      if (object && object.type === 'tag') {
+        const target = peelTag(repo, oid);
+        if (target !== oid) lines.push(pktLine(`${target} ${ref}^{}\n`));
+      }
+    }
+  }
+  lines.push(PKT_FLUSH);
+  return Buffer.concat(lines);
+}
+
+function wantsV2(req: IncomingMessage): boolean {
+  const header = req.headers['git-protocol'];
+  return typeof header === 'string' && header.includes('version=2');
+}
+
+function handleInfoRefs(
+  store: Store,
+  req: IncomingMessage,
+  res: ServerResponse,
+  repo: RepoRec,
+  service: string,
+): void {
+  if (service === 'git-upload-pack') {
+    if (wantsV2(req)) {
+      const body = Buffer.concat([
+        pktLine('version 2\n'),
+        pktLine(`agent=${AGENT_STRING}\n`),
+        pktLine('ls-refs=unborn\n'),
+        pktLine('fetch=shallow\n'),
+        pktLine('object-format=sha1\n'),
+        PKT_FLUSH,
+      ]);
+      sendBuffer(res, 200, body, 'application/x-git-upload-pack-advertisement');
+      return;
+    }
+    const body = Buffer.concat([
+      pktLine('# service=git-upload-pack\n'),
+      PKT_FLUSH,
+      refAdvertisement(repo, UPLOAD_CAPS),
     ]);
-    sendRaw(res, 200, body, 'application/x-git-upload-pack-advertisement');
+    sendBuffer(res, 200, body, 'application/x-git-upload-pack-advertisement');
     return;
   }
-  const caps = isUpload ? UPLOAD_CAPS_V0 : RECEIVE_CAPS_V0;
-  const lines: Pkt[] = [`# service=${service}\n`, 'flush'];
-  const refs = advertisedRefs(repo);
-  if (refs.length === 0) {
-    lines.push(`${ZERO_OID} capabilities^{}\0${caps}\n`);
-  } else {
-    refs.forEach((ref, index) => {
-      lines.push(index === 0 ? `${ref.oid} ${ref.name}\0${caps}\n` : `${ref.oid} ${ref.name}\n`);
-      if (ref.peeled !== undefined) lines.push(`${ref.peeled} ${ref.name}^{}\n`);
-    });
+  if (service === 'git-receive-pack') {
+    const body = Buffer.concat([
+      pktLine('# service=git-receive-pack\n'),
+      PKT_FLUSH,
+      refAdvertisement(repo, RECEIVE_CAPS),
+    ]);
+    sendBuffer(res, 200, body, 'application/x-git-receive-pack-advertisement');
+    return;
   }
-  lines.push('flush');
-  sendRaw(res, 200, pktEncode(lines), `application/x-${service}-advertisement`);
+  sendError(store, res, 400, 'Unknown service');
 }
 
-/** Split a pkt data payload into its text (before any NUL) and its capability string. */
-function splitCaps(payload: Buffer): { text: string; caps: string } {
-  const nul = payload.indexOf(0);
-  if (nul === -1) return { text: payload.toString('utf8'), caps: '' };
-  return { text: payload.subarray(0, nul).toString('utf8'), caps: payload.subarray(nul + 1).toString('utf8') };
+interface LsRefsArgs {
+  peel: boolean;
+  symrefs: boolean;
+  unborn: boolean;
+  refPrefixes: string[];
 }
 
-function handleLsRefs(info: ReqInfo, res: ServerResponse, repo: RepoRec, packets: PktPacket[]): void {
-  let peel = false;
-  let symrefs = false;
-  let unborn = false;
-  const prefixes: string[] = [];
-  let inArgs = false;
-  for (const packet of packets) {
-    if (packet.kind === 'delim') {
-      inArgs = true;
+function lsRefsResponse(repo: RepoRec, args: LsRefsArgs): Buffer {
+  const lines: Buffer[] = [];
+  const headTip = repo.refs.get(repo.headRef);
+  const includeHead =
+    args.refPrefixes.length === 0 || args.refPrefixes.some((prefix) => 'HEAD'.startsWith(prefix));
+  if (includeHead) {
+    if (headTip) {
+      const attrs = args.symrefs ? ` symref-target:${repo.headRef}` : '';
+      lines.push(pktLine(`${headTip} HEAD${attrs}\n`));
+    } else if (args.unborn) {
+      const attrs = args.symrefs ? ` symref-target:${repo.headRef}` : '';
+      lines.push(pktLine(`unborn HEAD${attrs}\n`));
+    }
+  }
+  for (const [ref, oid] of sortedRefs(repo)) {
+    if (args.refPrefixes.length > 0 && !args.refPrefixes.some((prefix) => ref.startsWith(prefix))) {
       continue;
     }
-    if (packet.kind === 'flush') break;
-    if (!inArgs) continue;
-    const line = packet.payload.toString('utf8').replace(/\n$/, '');
-    if (line === 'peel') peel = true;
-    else if (line === 'symrefs') symrefs = true;
-    else if (line === 'unborn') unborn = true;
-    else if (line.startsWith('ref-prefix ')) prefixes.push(line.slice('ref-prefix '.length));
-  }
-  const matches = (name: string): boolean => prefixes.length === 0 || prefixes.some((prefix) => name.startsWith(prefix));
-  const lines: Pkt[] = [];
-  const headTarget = `refs/heads/${repo.defaultBranch}`;
-  const headOid = repo.refs.get(headTarget);
-  if (matches('HEAD')) {
-    if (headOid !== undefined) {
-      lines.push(symrefs ? `${headOid} HEAD symref-target:${headTarget}\n` : `${headOid} HEAD\n`);
-    } else if (unborn) {
-      lines.push(symrefs ? `unborn HEAD symref-target:${headTarget}\n` : 'unborn HEAD\n');
+    let attrs = '';
+    const object = getObject(repo, oid);
+    if (args.peel && object && object.type === 'tag') {
+      attrs += ` peeled:${peelTag(repo, oid)}`;
     }
+    lines.push(pktLine(`${oid} ${ref}${attrs}\n`));
   }
-  const names = [...repo.refs.keys()].sort();
-  for (const name of names) {
-    if (!matches(name)) continue;
-    const oid = repo.refs.get(name) as string;
-    let line = `${oid} ${name}`;
-    if (peel) {
-      const obj = getObject(oid);
-      if (obj !== undefined && obj.type === 'tag') line += ` peeled:${peelToCommit(oid)}`;
-    }
-    lines.push(`${line}\n`);
-  }
-  lines.push('flush');
-  sendRaw(res, 200, pktEncode(lines), 'application/x-git-upload-pack-result');
+  lines.push(PKT_FLUSH);
+  return Buffer.concat(lines);
 }
 
-interface FetchArgs {
+interface FetchRequest {
   wants: string[];
   haves: string[];
-  shallow: Set<string>;
+  shallow: string[];
   depth: number | null;
-  deepenSince: number | null;
-  deepenNot: Set<string>;
-  done: boolean;
+  deepen: number | null;
 }
 
-function parseFetchLines(lines: string[], args: FetchArgs): void {
-  for (const raw of lines) {
-    const line = raw.replace(/\n$/, '');
-    if (line === 'done') args.done = true;
-    else if (line.startsWith('want ')) args.wants.push(line.slice(5).trim());
-    else if (line.startsWith('have ')) args.haves.push(line.slice(5).trim());
-    else if (line.startsWith('shallow ')) args.shallow.add(line.slice(8).trim());
-    else if (line.startsWith('deepen-not ')) args.deepenNot.add(line.slice('deepen-not '.length).trim());
-    else if (line.startsWith('deepen-since ')) {
-      const value = Number(line.slice('deepen-since '.length));
-      if (Number.isFinite(value)) args.deepenSince = value;
-    } else if (line.startsWith('deepen ')) {
-      const value = Number(line.slice('deepen '.length));
-      if (Number.isFinite(value) && value > 0) args.depth = value;
+function planFetch(repo: RepoRec, request: FetchRequest): { pack: Buffer; shallowLines: string[] } {
+  const wants = request.wants.filter((oid) => getObject(repo, oid) !== undefined);
+  const effectiveDepth = request.deepen ?? request.depth;
+  let packOids: string[] = [];
+  const shallowLines: string[] = [];
+  if (effectiveDepth !== null) {
+    const send = closureDepth(repo, wants, effectiveDepth, new Set());
+    let held = new Set<string>();
+    if (request.haves.length > 0) {
+      held = closureDepth(repo, request.haves, null, new Set(request.shallow)).objects;
     }
-  }
-}
-
-function handleFetchV2(info: ReqInfo, res: ServerResponse, repo: RepoRec, packets: PktPacket[]): void {
-  const args: FetchArgs = { wants: [], haves: [], shallow: new Set(), depth: null, deepenSince: null, deepenNot: new Set(), done: false };
-  let inArgs = false;
-  const lines: string[] = [];
-  for (const packet of packets) {
-    if (packet.kind === 'delim') {
-      inArgs = true;
-      continue;
+    packOids = [...send.objects].filter((oid) => !held.has(oid));
+    for (const boundary of send.boundary) shallowLines.push(`shallow ${boundary}`);
+    for (const previous of request.shallow) {
+      if (send.objects.has(previous) && !send.boundary.has(previous)) {
+        shallowLines.push(`unshallow ${previous}`);
+      }
     }
-    if (packet.kind === 'flush') break;
-    if (inArgs && packet.kind === 'data') lines.push(packet.payload.toString('utf8'));
-  }
-  parseFetchLines(lines, args);
-  const plan = planFetch(args.wants, args.haves, args.shallow, args.depth, args.deepenSince, args.deepenNot);
-  const ackLines: Pkt[] = ['acknowledgments\n'];
-  if (plan.commonHaves.length > 0) {
-    for (const have of plan.commonHaves) ackLines.push(`ACK ${have}\n`);
-    ackLines.push('ready\n');
   } else {
-    ackLines.push('NAK\n');
+    const send = closureFull(repo, wants);
+    const held = closureFull(repo, request.haves);
+    packOids = [...send].filter((oid) => !held.has(oid));
   }
-  if (!args.done && plan.commonHaves.length === 0) {
-    // A negotiation round with no common base yet: only the acknowledgments section goes back,
-    // and the client offers more haves (or `done`) in a follow-up request.
-    sendRaw(res, 200, pktEncode([...ackLines, 'flush']), 'application/x-git-upload-pack-result');
-    return;
-  }
-  // Once a common base exists the server declares `ready`, and real git then expects the
-  // shallow-info and packfile sections to follow in this same response, with or without `done`.
-  const head: Pkt[] = [];
-  // Real git rejects an acknowledgments section when the request carried no haves (it goes
-  // straight to expecting the packfile); the section is only for have negotiation.
-  if (args.haves.length > 0) {
-    head.push(...ackLines, 'delim');
-  }
-  if (plan.shallow.length > 0 || plan.unshallow.length > 0) {
-    head.push('shallow-info\n');
-    for (const oid of plan.shallow) head.push(`shallow ${oid}\n`);
-    for (const oid of plan.unshallow) head.push(`unshallow ${oid}\n`);
-    head.push('delim');
-  }
-  const parts: Buffer[] = [];
-  if (plan.packOids.length > 0) {
-    head.push('packfile\n');
-    parts.push(pktEncode(head), sidebandWrap(writePack(plan.packOids)), pktEncode(['flush']));
-  } else {
-    parts.push(pktEncode([...head, 'flush']));
-  }
-  sendRaw(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+  const objects = packOids
+    .map((oid) => getObject(repo, oid))
+    .filter((object): object is GitObject => object !== undefined);
+  return { pack: buildPack(objects), shallowLines };
 }
 
-function handleFetchV0(info: ReqInfo, res: ServerResponse, repo: RepoRec, packets: PktPacket[]): void {
-  const args: FetchArgs = { wants: [], haves: [], shallow: new Set(), depth: null, deepenSince: null, deepenNot: new Set(), done: false };
-  const lines: string[] = [];
-  for (const packet of packets) {
-    if (packet.kind === 'data') lines.push(splitCaps(packet.payload).text);
-  }
-  parseFetchLines(lines, args);
-  const plan = planFetch(args.wants, args.haves, args.shallow, args.depth, args.deepenSince, args.deepenNot);
-  const out: Pkt[] = [];
-  for (const oid of plan.shallow) out.push(`shallow ${oid}\n`);
-  for (const oid of plan.unshallow) out.push(`unshallow ${oid}\n`);
-  if (plan.commonHaves.length > 0) {
-    for (const have of plan.commonHaves) out.push(`ACK ${have}\n`);
-  } else {
-    out.push('NAK\n');
-  }
-  const parts: Buffer[] = [pktEncode(out)];
-  if (plan.packOids.length > 0) parts.push(sidebandWrap(writePack(plan.packOids)));
-  parts.push(pktEncode(['flush']));
-  sendRaw(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
-}
-
-function handleUploadPack(info: ReqInfo, res: ServerResponse, repo: RepoRec): void {
-  let packets: PktPacket[];
+function handleUploadPack(
+  store: Store,
+  req: IncomingMessage,
+  res: ServerResponse,
+  repo: RepoRec,
+  body: Buffer,
+): void {
+  let parsed: { items: PktItem[]; rest: Buffer };
   try {
-    packets = pktDecode(info.body);
+    parsed = parsePktStream(body);
   } catch {
-    sendRaw(res, 400, Buffer.from('error: malformed pkt-line\n'), 'application/x-git-upload-pack-result');
+    sendBuffer(res, 400, utf8('invalid pkt-line stream\n'), 'text/plain; charset=utf-8');
     return;
   }
-  let command = '';
-  for (const packet of packets) {
-    if (packet.kind === 'data') {
-      const line = packet.payload.toString('utf8').replace(/\n$/, '');
-      if (line.startsWith('command=')) command = line.slice('command='.length);
-      break;
-    }
-  }
-  if ((info.headers['git-protocol'] ?? '') === 'version=2' || command !== '') {
-    if (command === 'ls-refs') {
-      handleLsRefs(info, res, repo, packets);
+  const sections = pktSections(parsed.items);
+
+  if (wantsV2(req)) {
+    const headerLines = (sections[0] ?? []).map((line) => line.toString('utf8').replace(/\n$/, ''));
+    const command = headerLines.find((line) => line.startsWith('command='));
+    if (command === 'command=ls-refs') {
+      const args: LsRefsArgs = { peel: false, symrefs: false, unborn: false, refPrefixes: [] };
+      for (const raw of sections[1] ?? []) {
+        const line = raw.toString('utf8').replace(/\n$/, '');
+        if (line === 'peel') args.peel = true;
+        else if (line === 'symrefs') args.symrefs = true;
+        else if (line === 'unborn') args.unborn = true;
+        else if (line.startsWith('ref-prefix ')) args.refPrefixes.push(line.slice('ref-prefix '.length));
+      }
+      sendBuffer(res, 200, lsRefsResponse(repo, args), 'application/x-git-upload-pack-result');
       return;
     }
-    if (command === 'fetch') {
-      handleFetchV2(info, res, repo, packets);
+    if (command === 'command=fetch') {
+      const request: FetchRequest = { wants: [], haves: [], shallow: [], depth: null, deepen: null };
+      for (const raw of sections[1] ?? []) {
+        const line = raw.toString('utf8').replace(/\n$/, '');
+        if (line.startsWith('want ')) request.wants.push(line.slice(5).trim());
+        else if (line.startsWith('have ')) request.haves.push(line.slice(5).trim());
+        else if (line.startsWith('shallow ')) request.shallow.push(line.slice(8).trim());
+        else if (line.startsWith('deepen ')) request.deepen = Number(line.slice(7).trim());
+        else if (line.startsWith('deepen-since ')) request.deepen = null;
+      }
+      const { pack, shallowLines } = planFetch(repo, request);
+      const parts: Buffer[] = [];
+      if (request.haves.length > 0 || request.depth !== null || request.deepen !== null) {
+        parts.push(pktLine('acknowledgments\n'), pktLine('NAK\n'), PKT_DELIM);
+      }
+      if (shallowLines.length > 0) {
+        parts.push(pktLine('shallow-info\n'));
+        for (const line of shallowLines) parts.push(pktLine(`${line}\n`));
+        parts.push(PKT_DELIM);
+      }
+      parts.push(pktLine('packfile\n'));
+      parts.push(...sidebandPackets(pack, 1));
+      parts.push(PKT_FLUSH);
+      sendBuffer(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
       return;
     }
-    sendRaw(res, 400, Buffer.from('error: unknown command\n'), 'application/x-git-upload-pack-result');
+    sendBuffer(res, 400, utf8('unknown command\n'), 'text/plain; charset=utf-8');
     return;
   }
-  handleFetchV0(info, res, repo, packets);
+
+  // Protocol v0 fetch: wants in section 0, haves + done in section 1.
+  const request: FetchRequest = { wants: [], haves: [], shallow: [], depth: null, deepen: null };
+  for (const raw of sections[0] ?? []) {
+    const line = raw.toString('utf8').replace(/\n$/, '');
+    if (line.startsWith('want ')) request.wants.push(line.slice(5).trim().split(' ')[0]);
+    else if (line.startsWith('deepen ')) request.depth = Number(line.slice(7).trim());
+    else if (line.startsWith('shallow ')) request.shallow.push(line.slice(8).trim());
+  }
+  for (const raw of sections[1] ?? []) {
+    const line = raw.toString('utf8').replace(/\n$/, '');
+    if (line.startsWith('have ')) request.haves.push(line.slice(5).trim());
+    else if (line.startsWith('shallow ')) request.shallow.push(line.slice(8).trim());
+    else if (line.startsWith('deepen ')) request.depth = Number(line.slice(7).trim());
+  }
+  const { pack, shallowLines } = planFetch(repo, request);
+  const parts: Buffer[] = [];
+  for (const line of shallowLines) parts.push(pktLine(`${line}\n`));
+  parts.push(pktLine('NAK\n'));
+  parts.push(...sidebandPackets(pack, 1));
+  parts.push(PKT_FLUSH);
+  sendBuffer(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
 }
 
-interface PushCommandRec {
+// Split a receive-pack body into pkt-line commands and the raw pack tail.
+function splitPktPrefix(buf: Buffer): { lines: Buffer[]; rest: Buffer } {
+  const lines: Buffer[] = [];
+  let offset = 0;
+  while (offset + 4 <= buf.length) {
+    const hex = buf.subarray(offset, offset + 4).toString('ascii');
+    if (!/^[0-9a-fA-F]{4}$/.test(hex)) throw new Error('invalid pkt-line header');
+    const length = parseInt(hex, 16);
+    if (length === 0) return { lines, rest: buf.subarray(offset + 4) };
+    if (length < 4 || offset + length > buf.length) throw new Error('truncated pkt-line');
+    lines.push(Buffer.from(buf.subarray(offset + 4, offset + length)));
+    offset += length;
+  }
+  return { lines, rest: buf.subarray(offset) };
+}
+
+interface PushCommand {
   oldOid: string;
   newOid: string;
   ref: string;
 }
 
-function handleReceivePack(info: ReqInfo, res: ServerResponse, repo: RepoRec): void {
-  // Find the end of the pkt-line command block; the pack (if any) follows it.
-  let offset = 0;
-  const commands: PushCommandRec[] = [];
-  let caps = '';
-  let malformed = false;
-  while (offset + 4 <= info.body.length) {
-    const hex = info.body.subarray(offset, offset + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(hex)) {
-      malformed = true;
-      break;
-    }
-    const length = parseInt(hex, 16);
-    if (length === 0) {
-      offset += 4;
-      break;
-    }
-    if (length < 4 || offset + length > info.body.length) {
-      malformed = true;
-      break;
-    }
-    const payload = info.body.subarray(offset + 4, offset + length);
-    const { text, caps: lineCaps } = splitCaps(payload);
-    if (caps === '') caps = lineCaps;
-    const match = /^([0-9a-f]{40}) ([0-9a-f]{40}) (\S+)$/.exec(text.replace(/\n$/, ''));
-    if (match) commands.push({ oldOid: match[1] as string, newOid: match[2] as string, ref: match[3] as string });
-    offset += length;
-  }
-  if (malformed || commands.length === 0) {
-    // A malformed push must not kill the server; answer an HTTP error and keep serving.
-    sendRaw(res, 400, Buffer.from('error: malformed receive-pack request\n'), 'application/x-git-receive-pack-result');
+function handleReceivePack(
+  store: Store,
+  req: IncomingMessage,
+  res: ServerResponse,
+  repo: RepoRec,
+  body: Buffer,
+): void {
+  let lines: Buffer[];
+  let packBytes: Buffer;
+  try {
+    const split = splitPktPrefix(body);
+    lines = split.lines;
+    packBytes = split.rest;
+  } catch {
+    sendBuffer(res, 400, utf8('invalid pkt-line stream\n'), 'text/plain; charset=utf-8');
     return;
   }
-  const useSideband = caps.includes('side-band-64k');
-  const useReport = caps.includes('report-status');
-  const packBytes = info.body.subarray(offset);
-  let unpackOk = true;
+  const commands: PushCommand[] = [];
+  const capabilities = new Set<string>();
+  lines.forEach((raw, index) => {
+    let text = raw.toString('utf8').replace(/\n$/, '');
+    if (index === 0) {
+      const nul = text.indexOf('\0');
+      if (nul !== -1) {
+        for (const cap of text.slice(nul + 1).split(' ')) if (cap) capabilities.add(cap);
+        text = text.slice(0, nul);
+      }
+    }
+    const fields = text.split(' ');
+    if (fields.length >= 3) {
+      commands.push({ oldOid: fields[0], newOid: fields[1], ref: fields[2] });
+    }
+  });
+
+  let unpackError: string | null = null;
   if (packBytes.length > 0) {
     try {
-      readPack(packBytes);
-    } catch {
-      unpackOk = false;
+      const entries = readPack(packBytes, (oid) => repo.objects.get(oid));
+      for (const entry of entries) putObject(repo, entry.type, entry.data);
+    } catch (error) {
+      unpackError = error instanceof Error ? error.message : 'unpack failed';
     }
   }
-  const results: Array<{ ref: string; ok: boolean; reason?: string }> = [];
-  if (!unpackOk) {
-    for (const command of commands) results.push({ ref: command.ref, ok: false, reason: 'unpack failed' });
-  } else {
-    for (const command of commands) {
-      const current = repo.refs.get(command.ref);
-      if (command.newOid === ZERO_OID) {
-        // Delete.
-        if (command.ref === `refs/heads/${repo.defaultBranch}`) {
-          results.push({ ref: command.ref, ok: false, reason: 'denied: cannot delete the default branch' });
-          continue;
-        }
-        if (current !== undefined) repo.refs.delete(command.ref);
-        results.push({ ref: command.ref, ok: true });
-        continue;
-      }
-      const target = getObject(command.newOid);
-      if (target === undefined) {
-        results.push({ ref: command.ref, ok: false, reason: 'bad object' });
-        continue;
-      }
-      if (current !== undefined) {
-        const currentCommit = peelToCommit(current);
-        const newCommit = peelToCommit(command.newOid);
-        const objNew = getObject(newCommit);
-        if (objNew !== undefined && objNew.type === 'commit' && currentCommit !== newCommit && !isAncestor(currentCommit, newCommit)) {
-          results.push({ ref: command.ref, ok: false, reason: 'non-fast-forward' });
-          continue;
-        }
-      }
-      repo.refs.set(command.ref, command.newOid);
-      results.push({ ref: command.ref, ok: true });
-    }
-  }
-  if (!useReport) {
-    sendRaw(res, 200, Buffer.alloc(0), 'application/x-git-receive-pack-result');
-    return;
-  }
-  const reportLines: Pkt[] = [`unpack ${unpackOk ? 'ok' : 'index-pack failed'}\n`];
-  for (const result of results) {
-    reportLines.push(result.ok ? `ok ${result.ref}\n` : `ng ${result.ref} ${result.reason ?? 'rejected'}\n`);
-  }
-  reportLines.push('flush');
-  const report = pktEncode(reportLines);
-  const body = useSideband ? Buffer.concat([sidebandWrap(report), pktEncode(['flush'])]) : report;
-  sendRaw(res, 200, body, 'application/x-git-receive-pack-result');
-}
 
-/** Route /{owner}/{repo}.git/... — the repo must exist (a push cannot invent one). */
-function handleGit(info: ReqInfo, res: ServerResponse): void {
-  const seg = info.segments;
-  const repoName = (seg[1] as string).replace(/\.git$/, '');
-  const repo = findRepo(seg[0] as string, repoName);
-  if (repo === null) {
-    notFound(res);
-    return;
-  }
-  const tail = seg.slice(2).join('/');
-  if (tail === 'info/refs' && info.method === 'GET') {
-    const service = info.query.get('service') ?? '';
-    if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
-      sendJson(res, 400, { message: 'Missing or unknown service' });
-      return;
+  const results: { ref: string; ok: boolean; reason?: string }[] = [];
+  for (const command of commands) {
+    const fail = (reason: string): void => {
+      results.push({ ref: command.ref, ok: false, reason });
+    };
+    if (unpackError !== null) {
+      fail('unpack failed');
+      continue;
     }
-    handleInfoRefs(info, res, repo, service);
-    return;
+    const current = repo.refs.get(command.ref) ?? ZERO_OID;
+    if (command.oldOid !== current) {
+      fail('stale info');
+      continue;
+    }
+    if (command.newOid === ZERO_OID) {
+      if (command.ref === repo.headRef) {
+        fail('cannot delete the current branch');
+        continue;
+      }
+      repo.refs.delete(command.ref);
+      results.push({ ref: command.ref, ok: true });
+      continue;
+    }
+    const newObject = getObject(repo, command.newOid);
+    if (!newObject) {
+      fail('invalid object');
+      continue;
+    }
+    if (command.ref.startsWith('refs/heads/') && command.oldOid !== ZERO_OID) {
+      const oldCommit = resolveCommit(repo, command.oldOid);
+      const newCommit = resolveCommit(repo, command.newOid);
+      if (oldCommit && newCommit && !isAncestor(repo, oldCommit, newCommit)) {
+        fail('non-fast-forward');
+        continue;
+      }
+    }
+    repo.refs.set(command.ref, command.newOid);
+    results.push({ ref: command.ref, ok: true });
   }
-  if (tail === 'git-upload-pack' && info.method === 'POST') {
-    handleUploadPack(info, res, repo);
-    return;
+
+  const reportLines: string[] = [unpackError === null ? 'unpack ok' : `unpack ${unpackError}`];
+  for (const result of results) {
+    reportLines.push(result.ok ? `ok ${result.ref}` : `ng ${result.ref} ${result.reason ?? 'failed'}`);
   }
-  if (tail === 'git-receive-pack' && info.method === 'POST') {
-    handleReceivePack(info, res, repo);
-    return;
+  const reportStream = Buffer.concat([
+    ...reportLines.map((line) => pktLine(`${line}\n`)),
+    PKT_FLUSH,
+  ]);
+  let responseBody: Buffer;
+  if (capabilities.has('side-band-64k')) {
+    responseBody = Buffer.concat([...sidebandPackets(reportStream, 1), PKT_FLUSH]);
+  } else {
+    responseBody = reportStream;
   }
-  notFound(res);
+  sendBuffer(res, 200, responseBody, 'application/x-git-receive-pack-result');
 }
 
 // ---------------------------------------------------------------------------
-// GraphQL v4: a small parser and executor for the document shapes gh sends
+// GraphQL: a small parser + executor covering the document shapes the API
+// promises (viewer/repository/node/__type, issue & pull connections, and
+// the create/close/merge/comment mutations).
+// ---------------------------------------------------------------------------
 
 type GqlValue =
   | { kind: 'variable'; name: string }
@@ -2020,238 +2213,475 @@ type GqlValue =
   | { kind: 'boolean'; value: boolean }
   | { kind: 'null' }
   | { kind: 'enum'; value: string }
-  | { kind: 'list'; values: GqlValue[] }
-  | { kind: 'object'; fields: Array<{ name: string; value: GqlValue }> };
+  | { kind: 'list'; items: GqlValue[] }
+  | { kind: 'object'; fields: { name: string; value: GqlValue }[] };
 
-interface GqlSelection {
-  alias: string | null;
+interface GqlFieldNode {
+  kind: 'field';
+  alias?: string;
   name: string;
-  args: Map<string, GqlValue>;
-  selectionSet: GqlSelection[] | null;
-  fragmentSpread: string | null;
-  inlineOn: string | null;
+  args: { name: string; value: GqlValue }[];
+  selection?: GqlSelection[];
 }
 
+type GqlSelection =
+  | GqlFieldNode
+  | { kind: 'fragment'; typeCondition?: string; selection: GqlSelection[] }
+  | { kind: 'spread'; name: string };
+
 interface GqlOperation {
-  type: 'query' | 'mutation';
-  name: string | null;
-  selectionSet: GqlSelection[];
+  operation: 'query' | 'mutation';
+  name?: string;
+  variableDefaults: Map<string, GqlValue>;
+  selection: GqlSelection[];
 }
 
 interface GqlDocument {
   operations: GqlOperation[];
-  fragments: Map<string, { on: string; selectionSet: GqlSelection[] }>;
+  fragments: Map<string, { typeCondition?: string; selection: GqlSelection[] }>;
 }
 
-function tokenizeGql(source: string): string[] {
-  const tokens: string[] = [];
+interface GqlToken {
+  kind: 'name' | 'int' | 'float' | 'string' | 'punct' | 'spread' | 'eof';
+  value: string;
+}
+
+function gqlTokenize(source: string): GqlToken[] {
+  const tokens: GqlToken[] = [];
   let i = 0;
   while (i < source.length) {
-    const ch = source[i] as string;
+    const ch = source[i];
     if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === ',' || ch === '﻿') {
-      i += 1;
+      i++;
       continue;
     }
     if (ch === '#') {
-      while (i < source.length && source[i] !== '\n') i += 1;
+      while (i < source.length && source[i] !== '\n') i++;
       continue;
     }
     if (source.startsWith('...', i)) {
-      tokens.push('...');
+      tokens.push({ kind: 'spread', value: '...' });
       i += 3;
       continue;
     }
-    if ('{}()[]:=!$@|&'.includes(ch)) {
-      tokens.push(ch);
-      i += 1;
+    if ('{}()[]:=@$!|&'.includes(ch)) {
+      tokens.push({ kind: 'punct', value: ch });
+      i++;
       continue;
     }
     if (ch === '"') {
       if (source.startsWith('"""', i)) {
         const end = source.indexOf('"""', i + 3);
-        const raw = source.slice(i + 3, end === -1 ? source.length : end);
-        tokens.push(`"${raw.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
-        i = end === -1 ? source.length : end + 3;
+        if (end === -1) throw new Error('unterminated block string');
+        tokens.push({ kind: 'string', value: source.slice(i + 3, end) });
+        i = end + 3;
         continue;
       }
       let j = i + 1;
-      let out = '';
+      let raw = '"';
       while (j < source.length && source[j] !== '"') {
-        if (source[j] === '\\' && j + 1 < source.length) {
-          out += source[j] + (source[j + 1] as string);
+        if (source[j] === '\\') {
+          raw += source.slice(j, j + 2);
           j += 2;
         } else {
-          out += source[j];
-          j += 1;
+          raw += source[j];
+          j++;
         }
       }
-      tokens.push(`"${out}"`);
+      if (j >= source.length) throw new Error('unterminated string');
+      raw += '"';
+      tokens.push({ kind: 'string', value: JSON.parse(raw) as string });
       i = j + 1;
       continue;
     }
-    const match = /^[A-Za-z0-9_.-]+/.exec(source.slice(i));
-    if (match) {
-      tokens.push(match[0]);
-      i += match[0].length;
+    if (/[0-9-]/.test(ch)) {
+      const match = /^-?\d+(\.\d+)?([eE][+-]?\d+)?/.exec(source.slice(i));
+      if (!match) throw new Error('invalid number');
+      const text = match[0];
+      const isFloat = text.includes('.') || text.includes('e') || text.includes('E');
+      tokens.push({ kind: isFloat ? 'float' : 'int', value: text });
+      i += text.length;
       continue;
     }
-    i += 1;
+    if (/[_A-Za-z]/.test(ch)) {
+      const match = /^[_0-9A-Za-z]+/.exec(source.slice(i));
+      const text = (match as RegExpExecArray)[0];
+      tokens.push({ kind: 'name', value: text });
+      i += text.length;
+      continue;
+    }
+    throw new Error(`unexpected character ${JSON.stringify(ch)}`);
   }
+  tokens.push({ kind: 'eof', value: '' });
   return tokens;
 }
 
 class GqlParser {
-  private tokens: string[];
+  private tokens: GqlToken[];
   private pos = 0;
 
   constructor(source: string) {
-    this.tokens = tokenizeGql(source);
+    this.tokens = gqlTokenize(source);
   }
 
-  private peek(): string | undefined {
+  private peek(): GqlToken {
     return this.tokens[this.pos];
   }
 
-  private next(): string {
-    const token = this.tokens[this.pos];
-    this.pos += 1;
-    if (token === undefined) throw new Error('unexpected end of GraphQL document');
-    return token;
+  private next(): GqlToken {
+    return this.tokens[this.pos++];
   }
 
-  private expect(token: string): void {
-    const got = this.next();
-    if (got !== token) throw new Error(`expected ${token}, found ${got}`);
-  }
-
-  private skipBalanced(open: string, close: string): void {
-    this.expect(open);
-    let depth = 1;
-    while (depth > 0) {
-      const token = this.next();
-      if (token === open) depth += 1;
-      else if (token === close) depth -= 1;
+  private expectPunct(value: string): void {
+    const token = this.next();
+    if (token.kind !== 'punct' || token.value !== value) {
+      throw new Error(`expected '${value}' but found '${token.value}'`);
     }
+  }
+
+  private skipPunct(value: string): boolean {
+    const token = this.peek();
+    if (token.kind === 'punct' && token.value === value) {
+      this.pos++;
+      return true;
+    }
+    return false;
   }
 
   parseDocument(): GqlDocument {
     const operations: GqlOperation[] = [];
-    const fragments = new Map<string, { on: string; selectionSet: GqlSelection[] }>();
-    while (this.pos < this.tokens.length) {
+    const fragments = new Map<string, { typeCondition?: string; selection: GqlSelection[] }>();
+    while (this.peek().kind !== 'eof') {
       const token = this.peek();
-      if (token === 'query' || token === 'mutation' || token === 'subscription') {
-        this.next();
-        let name: string | null = null;
-        const maybeName = this.peek();
-        if (maybeName !== undefined && maybeName !== '(' && maybeName !== '{' && maybeName !== '@') name = this.next();
-        if (this.peek() === '(') this.skipBalanced('(', ')');
-        while (this.peek() === '@') {
-          this.next();
-          this.next();
-          if (this.peek() === '(') this.skipBalanced('(', ')');
-        }
-        const selectionSet = this.parseSelectionSet();
-        operations.push({ type: token === 'mutation' ? 'mutation' : 'query', name, selectionSet });
-      } else if (token === 'fragment') {
-        this.next();
-        const fragName = this.next();
-        this.expect('on');
-        const on = this.next();
-        const selectionSet = this.parseSelectionSet();
-        fragments.set(fragName, { on, selectionSet });
-      } else if (token === '{') {
-        operations.push({ type: 'query', name: null, selectionSet: this.parseSelectionSet() });
-      } else {
-        this.next();
+      if (token.kind === 'punct' && token.value === '{') {
+        operations.push({
+          operation: 'query',
+          variableDefaults: new Map(),
+          selection: this.parseSelectionSet(),
+        });
+        continue;
       }
+      if (token.kind === 'name' && (token.value === 'query' || token.value === 'mutation')) {
+        this.next();
+        const operation = token.value as 'query' | 'mutation';
+        let name: string | undefined;
+        if (this.peek().kind === 'name') name = this.next().value;
+        const variableDefaults = new Map<string, GqlValue>();
+        if (this.peek().kind === 'punct' && this.peek().value === '(') {
+          this.parseVariableDefinitions(variableDefaults);
+        }
+        this.skipDirectives();
+        operations.push({ operation, name, variableDefaults, selection: this.parseSelectionSet() });
+        continue;
+      }
+      if (token.kind === 'name' && token.value === 'fragment') {
+        this.next();
+        const fragName = this.next().value;
+        const onToken = this.next();
+        if (onToken.value !== 'on') throw new Error('expected on in fragment definition');
+        const typeCondition = this.next().value;
+        this.skipDirectives();
+        fragments.set(fragName, { typeCondition, selection: this.parseSelectionSet() });
+        continue;
+      }
+      throw new Error(`unexpected token '${token.value}' in document`);
     }
     return { operations, fragments };
   }
 
-  private parseSelectionSet(): GqlSelection[] {
-    this.expect('{');
-    const selections: GqlSelection[] = [];
-    while (this.peek() !== '}') {
-      if (this.peek() === undefined) throw new Error('unterminated selection set');
-      selections.push(this.parseSelection());
+  private parseVariableDefinitions(defaults: Map<string, GqlValue>): void {
+    this.expectPunct('(');
+    while (!this.skipPunct(')')) {
+      this.expectPunct('$');
+      const nameToken = this.next();
+      if (nameToken.kind !== 'name') throw new Error('expected variable name');
+      this.expectPunct(':');
+      this.parseType();
+      if (this.skipPunct('=')) {
+        defaults.set(nameToken.value, this.parseValue());
+      }
+      this.skipDirectives();
     }
-    this.expect('}');
-    return selections;
   }
 
-  private parseSelection(): GqlSelection {
-    if (this.peek() === '...') {
+  private parseType(): void {
+    if (this.skipPunct('[')) {
+      this.parseType();
+      this.expectPunct(']');
+    } else {
+      const token = this.next();
+      if (token.kind !== 'name') throw new Error('expected type name');
+    }
+    this.skipPunct('!');
+  }
+
+  private skipDirectives(): void {
+    while (this.peek().kind === 'punct' && this.peek().value === '@') {
       this.next();
-      if (this.peek() === 'on') {
-        this.next();
-        const on = this.next();
-        const selectionSet = this.parseSelectionSet();
-        return { alias: null, name: '', args: new Map(), selectionSet, fragmentSpread: null, inlineOn: on };
+      this.next(); // directive name
+      if (this.peek().kind === 'punct' && this.peek().value === '(') {
+        this.parseArguments();
       }
-      const spread = this.next();
-      return { alias: null, name: '', args: new Map(), selectionSet: null, fragmentSpread: spread, inlineOn: null };
     }
-    let name = this.next();
-    let alias: string | null = null;
-    if (this.peek() === ':') {
-      this.next();
-      alias = name;
-      name = this.next();
+  }
+
+  private parseArguments(): { name: string; value: GqlValue }[] {
+    const args: { name: string; value: GqlValue }[] = [];
+    this.expectPunct('(');
+    while (!this.skipPunct(')')) {
+      const nameToken = this.next();
+      if (nameToken.kind !== 'name') throw new Error('expected argument name');
+      this.expectPunct(':');
+      args.push({ name: nameToken.value, value: this.parseValue() });
     }
-    const args = new Map<string, GqlValue>();
-    if (this.peek() === '(') {
-      this.next();
-      while (this.peek() !== ')') {
-        const argName = this.next();
-        this.expect(':');
-        args.set(argName, this.parseValue());
-      }
-      this.expect(')');
-    }
-    while (this.peek() === '@') {
-      this.next();
-      this.next();
-      if (this.peek() === '(') this.skipBalanced('(', ')');
-    }
-    let selectionSet: GqlSelection[] | null = null;
-    if (this.peek() === '{') selectionSet = this.parseSelectionSet();
-    return { alias, name, args, selectionSet, fragmentSpread: null, inlineOn: null };
+    return args;
   }
 
   private parseValue(): GqlValue {
     const token = this.next();
-    if (token === '$') return { kind: 'variable', name: this.next() };
-    if (token === '[') {
-      const values: GqlValue[] = [];
-      while (this.peek() !== ']') values.push(this.parseValue());
-      this.expect(']');
-      return { kind: 'list', values };
+    if (token.kind === 'punct' && token.value === '$') {
+      const nameToken = this.next();
+      return { kind: 'variable', name: nameToken.value };
     }
-    if (token === '{') {
-      const fields: Array<{ name: string; value: GqlValue }> = [];
-      while (this.peek() !== '}') {
-        const name = this.next();
-        this.expect(':');
-        fields.push({ name, value: this.parseValue() });
+    if (token.kind === 'int') return { kind: 'int', value: parseInt(token.value, 10) };
+    if (token.kind === 'float') return { kind: 'float', value: parseFloat(token.value) };
+    if (token.kind === 'string') return { kind: 'string', value: token.value };
+    if (token.kind === 'punct' && token.value === '[') {
+      const items: GqlValue[] = [];
+      while (!this.skipPunct(']')) items.push(this.parseValue());
+      return { kind: 'list', items };
+    }
+    if (token.kind === 'punct' && token.value === '{') {
+      const fields: { name: string; value: GqlValue }[] = [];
+      while (!this.skipPunct('}')) {
+        const nameToken = this.next();
+        if (nameToken.kind !== 'name') throw new Error('expected object field name');
+        this.expectPunct(':');
+        fields.push({ name: nameToken.value, value: this.parseValue() });
       }
-      this.expect('}');
       return { kind: 'object', fields };
     }
-    if (token.startsWith('"')) {
-      return { kind: 'string', value: JSON.parse(token) as string };
+    if (token.kind === 'name') {
+      if (token.value === 'true') return { kind: 'boolean', value: true };
+      if (token.value === 'false') return { kind: 'boolean', value: false };
+      if (token.value === 'null') return { kind: 'null' };
+      return { kind: 'enum', value: token.value };
     }
-    if (token === 'true' || token === 'false') return { kind: 'boolean', value: token === 'true' };
-    if (token === 'null') return { kind: 'null' };
-    if (/^-?\d+$/.test(token)) return { kind: 'int', value: Number(token) };
-    if (/^-?\d*\.\d+/.test(token)) return { kind: 'float', value: Number(token) };
-    return { kind: 'enum', value: token };
+    throw new Error(`unexpected value token '${token.value}'`);
+  }
+
+  private parseSelectionSet(): GqlSelection[] {
+    this.expectPunct('{');
+    const selections: GqlSelection[] = [];
+    while (!this.skipPunct('}')) {
+      const token = this.peek();
+      if (token.kind === 'spread') {
+        this.next();
+        const after = this.peek();
+        if (after.kind === 'name' && after.value === 'on') {
+          this.next();
+          const typeCondition = this.next().value;
+          this.skipDirectives();
+          selections.push({ kind: 'fragment', typeCondition, selection: this.parseSelectionSet() });
+        } else if (after.kind === 'name') {
+          this.next();
+          this.skipDirectives();
+          selections.push({ kind: 'spread', name: after.value });
+        } else {
+          this.skipDirectives();
+          selections.push({ kind: 'fragment', selection: this.parseSelectionSet() });
+        }
+        continue;
+      }
+      if (token.kind === 'name') {
+        this.next();
+        let alias: string | undefined;
+        let name = token.value;
+        if (this.skipPunct(':')) {
+          alias = name;
+          name = this.next().value;
+        }
+        let args: { name: string; value: GqlValue }[] = [];
+        if (this.peek().kind === 'punct' && this.peek().value === '(') {
+          args = this.parseArguments();
+        }
+        this.skipDirectives();
+        let selection: GqlSelection[] | undefined;
+        if (this.peek().kind === 'punct' && this.peek().value === '{') {
+          selection = this.parseSelectionSet();
+        }
+        selections.push({ kind: 'field', alias, name, args, selection });
+        continue;
+      }
+      throw new Error(`unexpected token '${token.value}' in selection set`);
+    }
+    return selections;
   }
 }
 
-function resolveGqlValue(value: GqlValue, variables: Record<string, unknown>): unknown {
+// --- global ids ---------------------------------------------------------------
+
+function encodeGid(kind: string, key: string): string {
+  return utf8(`fg1:${kind}:${key}`).toString('base64');
+}
+
+function decodeGid(id: string): { kind: string; key: string } | null {
+  try {
+    const text = Buffer.from(id, 'base64').toString('utf8');
+    if (!text.startsWith('fg1:')) return null;
+    const rest = text.slice(4);
+    const colon = rest.indexOf(':');
+    if (colon === -1) return null;
+    return { kind: rest.slice(0, colon), key: rest.slice(colon + 1) };
+  } catch {
+    return null;
+  }
+}
+
+// --- typed source objects -----------------------------------------------------
+
+type GqlObj = { __typename: string } & Record<string, unknown>;
+
+function userObj(login: string): GqlObj {
+  return { __typename: 'User', login };
+}
+
+function repoObj(repo: RepoRec): GqlObj {
+  return { __typename: 'Repository', repo };
+}
+
+function issueObj(repo: RepoRec, issue: IssueRec): GqlObj {
+  return { __typename: 'Issue', repo, issue };
+}
+
+function pullObj(repo: RepoRec, pull: PullRec): GqlObj {
+  return { __typename: 'PullRequest', repo, pull };
+}
+
+function encodeCursor(offset: number): string {
+  return utf8(`idx:${offset}`).toString('base64');
+}
+
+function decodeCursor(cursor: unknown): number {
+  if (typeof cursor !== 'string') return 0;
+  try {
+    const text = Buffer.from(cursor, 'base64').toString('utf8');
+    const match = /^idx:(\d+)$/.exec(text);
+    return match ? Number(match[1]) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function connectionObj(
+  typeName: string,
+  allNodes: GqlObj[],
+  args: Record<string, unknown>,
+): GqlObj {
+  const first = typeof args.first === 'number' ? Math.max(0, Math.floor(args.first)) : allNodes.length;
+  const start = decodeCursor(args.after);
+  const nodes = allNodes.slice(start, start + first);
+  const hasNextPage = start + nodes.length < allNodes.length;
+  return {
+    __typename: typeName,
+    nodes,
+    pageInfo: {
+      __typename: 'PageInfo',
+      hasNextPage,
+      hasPreviousPage: start > 0,
+      startCursor: encodeCursor(start),
+      endCursor: encodeCursor(start + nodes.length),
+    },
+    totalCount: allNodes.length,
+  };
+}
+
+// --- __type support -----------------------------------------------------------
+
+const TYPE_FIELDS: Record<string, string[]> = {
+  Query: ['viewer', 'repository', 'node', 'search', 'rateLimit'],
+  Mutation: ['createIssue', 'closeIssue', 'createPullRequest', 'mergePullRequest', 'addComment'],
+  User: ['login', 'id', 'name', 'email', 'avatarUrl', 'url', 'isViewer'],
+  Repository: [
+    'id', 'databaseId', 'name', 'nameWithOwner', 'owner', 'description', 'isPrivate', 'private',
+    'defaultBranchRef', 'viewerPermission', 'hasIssuesEnabled', 'hasPullRequestsEnabled',
+    'issue', 'issues', 'pullRequests', 'pullRequest', 'createdAt', 'updatedAt', 'url',
+  ],
+  Issue: [
+    'id', 'number', 'title', 'state', 'body', 'author', 'labels', 'comments', 'repository',
+    'createdAt', 'updatedAt', 'closed', 'url',
+  ],
+  PullRequest: [
+    'id', 'number', 'title', 'body', 'state', 'merged', 'mergedAt', 'mergeCommitSha', 'mergeable',
+    'headRefName', 'baseRefName', 'headRef', 'baseRef', 'files', 'author', 'createdAt', 'updatedAt',
+    'closed', 'url', 'changedFiles', 'additions', 'deletions',
+  ],
+  Ref: ['name', 'prefix', 'target'],
+  Commit: ['oid', 'message', 'committedDate'],
+  Label: ['id', 'name', 'color'],
+  Comment: ['id', 'body', 'author', 'createdAt', 'updatedAt'],
+  PageInfo: ['hasNextPage', 'hasPreviousPage', 'startCursor', 'endCursor'],
+  IssueConnection: ['nodes', 'pageInfo', 'totalCount', 'edges'],
+  PullRequestConnection: ['nodes', 'pageInfo', 'totalCount', 'edges'],
+  CommentConnection: ['nodes', 'pageInfo', 'totalCount', 'edges'],
+  LabelConnection: ['nodes', 'pageInfo', 'totalCount', 'edges'],
+  PullRequestFileConnection: ['nodes', 'pageInfo', 'totalCount', 'edges'],
+  PullRequestFile: ['path', 'additions', 'deletions'],
+  CreateIssuePayload: ['issue', 'clientMutationId'],
+  CloseIssuePayload: ['issue', 'clientMutationId'],
+  CreatePullRequestPayload: ['pullRequest', 'clientMutationId'],
+  MergePullRequestPayload: ['pullRequest', 'clientMutationId'],
+  AddCommentPayload: ['commentEdge', 'subject', 'clientMutationId'],
+  CommentEdge: ['node', 'cursor'],
+};
+
+const ENUM_TYPES: Record<string, string[]> = {
+  SearchType: ['ISSUE', 'REPOSITORY', 'USER', 'DISCUSSION', 'CODE'],
+  IssueState: ['OPEN', 'CLOSED'],
+  PullRequestState: ['OPEN', 'CLOSED', 'MERGED'],
+  MergeableState: ['MERGEABLE', 'CONFLICTING', 'UNKNOWN'],
+};
+
+function typeDescriptor(name: string): GqlObj | null {
+  if (ENUM_TYPES[name]) {
+    return {
+      __typename: '__Type',
+      name,
+      kind: 'ENUM',
+      fields: null,
+      enumValues: ENUM_TYPES[name].map((value) => ({ __typename: '__EnumValue', name: value })),
+    };
+  }
+  if (TYPE_FIELDS[name]) {
+    return {
+      __typename: '__Type',
+      name,
+      kind: 'OBJECT',
+      fields: TYPE_FIELDS[name].map((field) => ({ __typename: '__Field', name: field })),
+      enumValues: null,
+    };
+  }
+  if (name === '__Type' || name === '__Field' || name === '__EnumValue' || name === '__Schema') {
+    return { __typename: '__Type', name, kind: 'OBJECT', fields: [], enumValues: null };
+  }
+  return null;
+}
+
+// --- field resolution -----------------------------------------------------------
+
+const UNKNOWN_FIELD = Symbol('unknown-field');
+
+interface GqlExecContext {
+  store: Store;
+  variables: Record<string, unknown>;
+  fragments: Map<string, { typeCondition?: string; selection: GqlSelection[] }>;
+  errors: { message: string }[];
+}
+
+function evalGqlValue(value: GqlValue, ctx: GqlExecContext): unknown {
   switch (value.kind) {
     case 'variable':
-      return variables[value.name];
+      return ctx.variables[value.name];
     case 'int':
     case 'float':
     case 'string':
@@ -2261,1040 +2691,946 @@ function resolveGqlValue(value: GqlValue, variables: Record<string, unknown>): u
     case 'null':
       return null;
     case 'list':
-      return value.values.map((entry) => resolveGqlValue(entry, variables));
+      return value.items.map((item) => evalGqlValue(item, ctx));
     case 'object': {
       const out: Record<string, unknown> = {};
-      for (const field of value.fields) out[field.name] = resolveGqlValue(field.value, variables);
+      for (const field of value.fields) out[field.name] = evalGqlValue(field.value, ctx);
       return out;
     }
   }
 }
 
-// --- GraphQL sources and global ids
-
-/** Global (Relay) id: base64 of `Type:part[:part]`, opaque and stable. */
-function globalId(type: string, ...parts: Array<string | number>): string {
-  return Buffer.from(`${type}:${parts.join(':')}`, 'utf8').toString('base64');
-}
-
-function parseGlobalId(id: string): { type: string; parts: string[] } | null {
-  try {
-    const text = Buffer.from(id, 'base64').toString('utf8');
-    const parts = text.split(':');
-    const type = parts.shift();
-    if (type === undefined || type === '') return null;
-    return { type, parts };
-  } catch {
-    return null;
-  }
-}
-
-function repoByDbId(dbId: number): RepoRec | null {
-  for (const repo of state.repos.values()) if (repo.dbId === dbId) return repo;
-  return null;
-}
-
-type GqlSource =
-  | { gqlType: 'User' }
-  | { gqlType: 'Repository'; repo: RepoRec }
-  | { gqlType: 'Issue'; repo: RepoRec; issue: IssueRec }
-  | { gqlType: 'PullRequest'; repo: RepoRec; pull: PullRec }
-  | { gqlType: 'IssueComment'; repo: RepoRec; issue: IssueRec; comment: CommentRec }
-  | { gqlType: 'Ref'; name: string }
-  | { gqlType: 'IssueConnection'; nodes: GqlSource[]; pageInfo: Record<string, unknown>; totalCount: number }
-  | { gqlType: 'PullRequestConnection'; nodes: GqlSource[]; pageInfo: Record<string, unknown>; totalCount: number }
-  | { gqlType: 'PullRequestChangedFile'; path: string; additions: number; deletions: number }
-  | { gqlType: 'PullRequestFileConnection'; nodes: GqlSource[] }
-  | { gqlType: '__Type'; typeName: string }
-  | { gqlType: '__Field'; fieldName: string }
-  | { gqlType: '__EnumValue'; enumName: string }
-  | { gqlType: 'CreateIssuePayload'; issue: GqlSource | null }
-  | { gqlType: 'CloseIssuePayload'; issue: GqlSource | null }
-  | { gqlType: 'CreatePullRequestPayload'; pull: GqlSource | null }
-  | { gqlType: 'MergePullRequestPayload'; pull: GqlSource | null }
-  | { gqlType: 'AddCommentPayload'; comment: GqlSource | null }
-  | { gqlType: 'CommentEdge'; node: GqlSource | null };
-
-const SCHEMA_FIELDS: Record<string, string[]> = {
-  Query: ['viewer', 'repository', 'node', 'user', 'organization', 'search', '__type', '__schema'],
-  Mutation: [
-    'createIssue',
-    'closeIssue',
-    'reopenIssue',
-    'createPullRequest',
-    'mergePullRequest',
-    'addComment',
-    'updateIssue',
-    'updatePullRequest',
-  ],
-  User: ['id', 'databaseId', 'login', 'name', 'url', 'email', 'repositories', 'issues', 'pullRequests', 'createdAt', 'updatedAt'],
-  Repository: [
-    'id',
-    'databaseId',
-    'name',
-    'nameWithOwner',
-    'owner',
-    'description',
-    'isPrivate',
-    'isFork',
-    'url',
-    'homepageUrl',
-    'defaultBranchRef',
-    'viewerPermission',
-    'hasIssuesEnabled',
-    'hasPullRequestsEnabled',
-    'issue',
-    'issues',
-    'pullRequest',
-    'pullRequests',
-    'createdAt',
-    'updatedAt',
-    'refs',
-    'stargazerCount',
-    'forkCount',
-  ],
-  Issue: [
-    'id',
-    'databaseId',
-    'number',
-    'title',
-    'state',
-    'body',
-    'bodyText',
-    'bodyHTML',
-    'url',
-    'author',
-    'repository',
-    'labels',
-    'comments',
-    'assignees',
-    'createdAt',
-    'updatedAt',
-    'closedAt',
-    'locked',
-  ],
-  PullRequest: [
-    'id',
-    'databaseId',
-    'number',
-    'title',
-    'body',
-    'bodyText',
-    'state',
-    'merged',
-    'mergedAt',
-    'mergeable',
-    'headRefName',
-    'baseRefName',
-    'headRef',
-    'baseRef',
-    'headRefOid',
-    'baseRefOid',
-    'mergeCommit',
-    'files',
-    'commits',
-    'comments',
-    'author',
-    'repository',
-    'additions',
-    'deletions',
-    'changedFiles',
-    'createdAt',
-    'updatedAt',
-    'closedAt',
-    'url',
-    'isDraft',
-  ],
-  IssueComment: ['id', 'databaseId', 'body', 'bodyText', 'author', 'createdAt', 'updatedAt', 'url'],
-  Ref: ['id', 'name', 'prefix', 'target', 'repository'],
-  IssueConnection: ['nodes', 'edges', 'pageInfo', 'totalCount'],
-  PullRequestConnection: ['nodes', 'edges', 'pageInfo', 'totalCount'],
-  PullRequestChangedFile: ['path', 'additions', 'deletions'],
-  PullRequestFileConnection: ['nodes', 'edges', 'pageInfo', 'totalCount'],
-  PageInfo: ['hasNextPage', 'hasPreviousPage', 'startCursor', 'endCursor'],
-  CreateIssuePayload: ['issue', 'clientMutationId'],
-  CloseIssuePayload: ['issue', 'clientMutationId'],
-  CreatePullRequestPayload: ['pullRequest', 'clientMutationId'],
-  MergePullRequestPayload: ['pullRequest', 'clientMutationId'],
-  AddCommentPayload: ['commentEdge', 'subject', 'clientMutationId'],
-  CommentEdge: ['node', 'cursor'],
-  __Type: ['kind', 'name', 'description', 'fields', 'enumValues', 'possibleTypes', 'inputFields', 'interfaces', 'ofType'],
-  __Field: ['name', 'description', 'args', 'type', 'isDeprecated', 'deprecationReason'],
-  __EnumValue: ['name', 'description', 'isDeprecated', 'deprecationReason'],
-  __InputValue: ['name', 'description', 'type', 'defaultValue'],
-};
-
-const SCHEMA_ENUMS: Record<string, string[]> = {
-  IssueState: ['OPEN', 'CLOSED'],
-  PullRequestState: ['OPEN', 'CLOSED', 'MERGED'],
-  MergeableState: ['MERGEABLE', 'CONFLICTING', 'UNKNOWN'],
-  PullRequestMergeMethod: ['MERGE', 'SQUASH', 'REBASE'],
-  RepositoryPermission: ['ADMIN', 'MAINTAIN', 'WRITE', 'TRIAGE', 'READ'],
-  SearchType: ['ISSUE', 'REPOSITORY', 'USER', 'DISCUSSION'],
-  IssueOrderField: ['CREATED_AT', 'UPDATED_AT', 'COMMENTS'],
-  OrderDirection: ['ASC', 'DESC'],
-  DefaultPeriod: [],
-};
-
-function cursorOf(index: number): string {
-  return Buffer.from(`cursor:${index}`, 'utf8').toString('base64');
-}
-
-function indexOfCursor(cursor: unknown): number {
-  if (typeof cursor !== 'string' || cursor === '') return -1;
-  const text = Buffer.from(cursor, 'base64').toString('utf8');
-  const match = /^cursor:(\d+)$/.exec(text);
-  return match ? Number(match[1]) : -1;
-}
-
-interface GqlCtx {
-  variables: Record<string, unknown>;
-  fragments: Map<string, { on: string; selectionSet: GqlSelection[] }>;
-  errors: Array<{ message: string }>;
-}
-
-function argOf(selection: GqlSelection, ctx: GqlCtx, name: string): unknown {
-  const value = selection.args.get(name);
-  return value === undefined ? undefined : resolveGqlValue(value, ctx.variables);
-}
-
-function repoSource(repo: RepoRec): GqlSource {
-  return { gqlType: 'Repository', repo };
-}
-
-function issueSource(repo: RepoRec, issue: IssueRec): GqlSource {
-  return { gqlType: 'Issue', repo, issue };
-}
-
-function pullSource(repo: RepoRec, pull: PullRec): GqlSource {
-  return { gqlType: 'PullRequest', repo, pull };
-}
-
-function sourceId(source: GqlSource): string {
-  switch (source.gqlType) {
-    case 'User':
-      return globalId('User', 1000);
-    case 'Repository':
-      return globalId('Repository', source.repo.dbId);
-    case 'Issue':
-      return globalId('Issue', source.repo.dbId, source.issue.number);
-    case 'PullRequest':
-      return globalId('PullRequest', source.repo.dbId, source.pull.number);
-    case 'IssueComment':
-      return globalId('IssueComment', source.comment.dbId);
-    case 'Ref':
-      return globalId('Ref', source.name);
-    default:
-      return globalId(source.gqlType, 1);
-  }
-}
-
-/** Decode a global id back to its source (for node(id:) and mutation inputs). */
-function sourceFromGlobalId(id: string): GqlSource | null {
-  const parsed = parseGlobalId(id);
-  if (parsed === null) return null;
-  if (parsed.type === 'Repository') {
-    const repo = repoByDbId(Number(parsed.parts[0]));
-    return repo === null ? null : repoSource(repo);
-  }
-  if (parsed.type === 'Issue') {
-    const repo = repoByDbId(Number(parsed.parts[0]));
-    const issue = repo?.issues.get(Number(parsed.parts[1]));
-    return repo !== null && repo !== undefined && issue !== undefined ? issueSource(repo, issue) : null;
-  }
-  if (parsed.type === 'PullRequest') {
-    const repo = repoByDbId(Number(parsed.parts[0]));
-    const pull = repo?.pulls.get(Number(parsed.parts[1]));
-    return repo !== null && repo !== undefined && pull !== undefined ? pullSource(repo, pull) : null;
-  }
-  if (parsed.type === 'User') return { gqlType: 'User' };
-  return null;
-}
-
-function issueConnection(repo: RepoRec, selection: GqlSelection, ctx: GqlCtx): GqlSource {
-  let issues = [...repo.issues.values()];
-  const states = argOf(selection, ctx, 'states');
-  if (Array.isArray(states)) {
-    const wanted = states.map((entry) => String(entry).toLowerCase());
-    issues = issues.filter((issue) => wanted.includes(issue.state));
-  }
-  const orderBy = argOf(selection, ctx, 'orderBy');
-  let descending = false;
-  if (typeof orderBy === 'object' && orderBy !== null) {
-    descending = (orderBy as Record<string, unknown>).direction === 'DESC';
-  }
-  issues.sort((a, b) => (descending ? b.number - a.number : a.number - b.number));
-  const after = argOf(selection, ctx, 'after');
-  const startIndex = Math.max(0, indexOfCursor(after) + 1);
-  const firstRaw = argOf(selection, ctx, 'first');
-  const first = typeof firstRaw === 'number' ? firstRaw : 30;
-  const slice = issues.slice(startIndex, startIndex + first);
-  const hasNext = startIndex + slice.length < issues.length;
-  const pageInfo: Record<string, unknown> = {
-    hasNextPage: hasNext,
-    hasPreviousPage: startIndex > 0,
-    startCursor: slice.length > 0 ? cursorOf(startIndex) : null,
-    endCursor: slice.length > 0 ? cursorOf(startIndex + slice.length - 1) : null,
-  };
-  return {
-    gqlType: 'IssueConnection',
-    nodes: slice.map((issue) => issueSource(repo, issue)),
-    pageInfo,
-    totalCount: issues.length,
-  };
-}
-
-function pullConnection(repo: RepoRec, selection: GqlSelection, ctx: GqlCtx): GqlSource {
-  let pulls = [...repo.pulls.values()];
-  const states = argOf(selection, ctx, 'states');
-  if (Array.isArray(states)) {
-    const wanted = states.map((entry) => String(entry));
-    pulls = pulls.filter((pull) => {
-      const gqlState = pull.merged ? 'MERGED' : pull.state === 'open' ? 'OPEN' : 'CLOSED';
-      return wanted.includes(gqlState);
-    });
-  } else {
-    pulls = pulls.filter((pull) => pull.state === 'open');
-  }
-  pulls.sort((a, b) => b.number - a.number);
-  const after = argOf(selection, ctx, 'after');
-  const startIndex = Math.max(0, indexOfCursor(after) + 1);
-  const firstRaw = argOf(selection, ctx, 'first');
-  const first = typeof firstRaw === 'number' ? firstRaw : 30;
-  const slice = pulls.slice(startIndex, startIndex + first);
-  const pageInfo: Record<string, unknown> = {
-    hasNextPage: startIndex + slice.length < pulls.length,
-    hasPreviousPage: startIndex > 0,
-    startCursor: slice.length > 0 ? cursorOf(startIndex) : null,
-    endCursor: slice.length > 0 ? cursorOf(startIndex + slice.length - 1) : null,
-  };
-  return {
-    gqlType: 'PullRequestConnection',
-    nodes: slice.map((pull) => pullSource(repo, pull)),
-    pageInfo,
-    totalCount: pulls.length,
-  };
-}
-
-type GqlRaw = unknown;
-
-/** Resolve one field on one source. Returns a scalar, a source, an array of either, or null. */
-function resolveGqlField(typeName: string, source: GqlSource | null, selection: GqlSelection, ctx: GqlCtx): GqlRaw {
-  const name = selection.name;
-  if (name === '__typename') return source?.gqlType ?? typeName;
-  if (typeName === 'Query') {
-    if (name === 'viewer') return { gqlType: 'User' } as GqlSource;
-    if (name === 'repository') {
-      const owner = String(argOf(selection, ctx, 'owner') ?? '');
-      const repoName = String(argOf(selection, ctx, 'name') ?? '');
-      if (state.login === null) learnLogin(owner);
-      if (owner !== viewerLogin()) return null;
-      const repo = state.repos.get(repoName.toLowerCase());
-      return repo === undefined ? null : repoSource(repo);
-    }
-    if (name === 'node') {
-      const id = String(argOf(selection, ctx, 'id') ?? '');
-      return sourceFromGlobalId(id);
-    }
-    if (name === '__type') {
-      const typeArg = String(argOf(selection, ctx, 'name') ?? '');
-      if (SCHEMA_FIELDS[typeArg] !== undefined || SCHEMA_ENUMS[typeArg] !== undefined || typeArg === 'PageInfo') {
-        return { gqlType: '__Type', typeName: typeArg } as GqlSource;
-      }
-      return null;
-    }
-    if (name === 'user') return { gqlType: 'User' } as GqlSource;
-    return undefined;
-  }
-  if (typeName === 'Mutation') return resolveGqlMutation(name, selection, ctx);
-  if (source === null) return null;
-  switch (source.gqlType) {
-    case 'User':
-      if (name === 'login') return viewerLogin();
-      if (name === 'id') return sourceId(source);
-      if (name === 'databaseId') return 1000;
-      if (name === 'name') return viewerLogin();
-      return null;
-    case 'Repository': {
-      const repo = source.repo;
-      switch (name) {
-        case 'id': return sourceId(source);
-        case 'databaseId': return repo.dbId;
-        case 'name': return repo.name;
-        case 'nameWithOwner': return `${viewerLogin()}/${repo.name}`;
-        case 'owner': return { gqlType: 'User' } as GqlSource;
-        case 'description': return repo.description;
-        case 'isPrivate': return repo.isPrivate;
-        case 'isFork': return false;
-        case 'url': return `http://forge.local/${viewerLogin()}/${repo.name}`;
-        case 'homepageUrl': return null;
-        case 'defaultBranchRef': return { gqlType: 'Ref', name: repo.defaultBranch } as GqlSource;
-        case 'viewerPermission': return 'ADMIN';
-        case 'hasIssuesEnabled': return true;
-        case 'hasPullRequestsEnabled': return true;
-        case 'stargazerCount': return 0;
-        case 'forkCount': return 0;
-        case 'createdAt':
-        case 'updatedAt': return isoOf(1767225600 + repo.seq * 61);
-        case 'issue': {
-          const number = Number(argOf(selection, ctx, 'number'));
-          const issue = repo.issues.get(number);
-          return issue === undefined ? null : issueSource(repo, issue);
-        }
-        case 'issues': return issueConnection(repo, selection, ctx);
-        case 'pullRequest': {
-          const number = Number(argOf(selection, ctx, 'number'));
-          const pull = repo.pulls.get(number);
-          return pull === undefined ? null : pullSource(repo, pull);
-        }
-        case 'pullRequests': return pullConnection(repo, selection, ctx);
-        default: return null;
-      }
-    }
-    case 'Issue': {
-      const { issue } = source;
-      switch (name) {
-        case 'id': return sourceId(source);
-        case 'databaseId': return issue.dbId;
-        case 'number': return issue.number;
-        case 'title': return issue.title;
-        case 'state': return issue.state === 'open' ? 'OPEN' : 'CLOSED';
-        case 'body':
-        case 'bodyText': return issue.body;
-        case 'bodyHTML': return issue.body;
-        case 'url': return `http://forge.local/${viewerLogin()}/${source.repo.name}/issues/${issue.number}`;
-        case 'author': return { gqlType: 'User' } as GqlSource;
-        case 'repository': return repoSource(source.repo);
-        case 'createdAt':
-        case 'updatedAt': return isoOf(1767225600 + issue.seq * 61);
-        case 'closedAt': return issue.state === 'closed' ? isoOf(1767225600 + issue.seq * 61) : null;
-        case 'locked': return false;
-        default: return null;
-      }
-    }
-    case 'PullRequest': {
-      const { pull, repo } = source;
-      switch (name) {
-        case 'id': return sourceId(source);
-        case 'databaseId': return pull.dbId;
-        case 'number': return pull.number;
-        case 'title': return pull.title;
-        case 'body':
-        case 'bodyText': return pull.body;
-        case 'state': return pull.merged ? 'MERGED' : pull.state === 'open' ? 'OPEN' : 'CLOSED';
-        case 'merged': return pull.merged;
-        case 'mergedAt': return pull.merged ? isoOf(1767225600 + pull.seq * 61) : null;
-        case 'mergeable': {
-          if (pull.state !== 'open') return 'UNKNOWN';
-          return mergeSimulation(repo, pull).conflict ? 'CONFLICTING' : 'MERGEABLE';
-        }
-        case 'headRefName': return pull.headRef;
-        case 'baseRefName': return pull.baseRef;
-        case 'headRef': return { gqlType: 'Ref', name: pull.headRef } as GqlSource;
-        case 'baseRef': return { gqlType: 'Ref', name: pull.baseRef } as GqlSource;
-        case 'headRefOid': return refSha(repo, pull.headRef) ?? ZERO_OID;
-        case 'baseRefOid': return refSha(repo, pull.baseRef) ?? ZERO_OID;
-        case 'mergeCommit': return null;
-        case 'author': return { gqlType: 'User' } as GqlSource;
-        case 'repository': return repoSource(repo);
-        case 'createdAt':
-        case 'updatedAt': return isoOf(1767225600 + pull.seq * 61);
-        case 'closedAt': return pull.state === 'closed' ? isoOf(1767225600 + pull.seq * 61) : null;
-        case 'url': return `http://forge.local/${viewerLogin()}/${repo.name}/pull/${pull.number}`;
-        case 'isDraft': return false;
-        case 'files': {
-          const files = pullFiles(repo, pull);
-          const firstRaw = argOf(selection, ctx, 'first');
-          const first = typeof firstRaw === 'number' ? firstRaw : 100;
-          return {
-            gqlType: 'PullRequestFileConnection',
-            nodes: files.slice(0, first).map((file) => ({
-              gqlType: 'PullRequestChangedFile',
-              path: String(file.filename),
-              additions: Number(file.additions),
-              deletions: Number(file.deletions),
-            })),
-          } as GqlSource;
-        }
-        case 'additions': return pullFiles(repo, pull).reduce((sum, file) => sum + Number(file.additions), 0);
-        case 'deletions': return pullFiles(repo, pull).reduce((sum, file) => sum + Number(file.deletions), 0);
-        case 'changedFiles': return pullFiles(repo, pull).length;
-        default: return null;
-      }
-    }
-    case 'IssueComment':
-      switch (name) {
-        case 'id': return sourceId(source);
-        case 'databaseId': return source.comment.dbId;
-        case 'body':
-        case 'bodyText': return source.comment.body;
-        case 'author': return { gqlType: 'User' } as GqlSource;
-        case 'createdAt':
-        case 'updatedAt': return isoOf(1767225600 + source.comment.seq * 61);
-        case 'url': return `http://forge.local/${viewerLogin()}/${source.repo.name}/issues/${source.issue.number}`;
-        default: return null;
-      }
-    case 'Ref':
-      if (name === 'name') return source.name;
-      if (name === 'prefix') return 'refs/heads/';
-      if (name === 'id') return sourceId(source);
-      return null;
-    case 'IssueConnection':
-    case 'PullRequestConnection':
-      if (name === 'nodes') return source.nodes;
-      if (name === 'totalCount') return source.totalCount;
-      if (name === 'pageInfo') return source.pageInfo;
-      if (name === 'edges') {
-        return source.nodes.map((node, index) => ({ node, cursor: cursorOf(index) }));
-      }
-      return null;
-    case 'PullRequestFileConnection':
-      if (name === 'nodes') return source.nodes;
-      if (name === 'totalCount') return source.nodes.length;
-      if (name === 'pageInfo') return { hasNextPage: false, hasPreviousPage: false, startCursor: null, endCursor: null };
-      return null;
-    case 'PullRequestChangedFile':
-      if (name === 'path') return source.path;
-      if (name === 'additions') return source.additions;
-      if (name === 'deletions') return source.deletions;
-      return null;
-    case '__Type': {
-      const fields = SCHEMA_FIELDS[source.typeName];
-      const enums = SCHEMA_ENUMS[source.typeName];
-      if (name === 'kind') return enums !== undefined ? 'ENUM' : 'OBJECT';
-      if (name === 'name') return source.typeName;
-      if (name === 'description') return null;
-      if (name === 'fields') {
-        return (fields ?? []).map((fieldName) => ({ gqlType: '__Field', fieldName }) as GqlSource);
-      }
-      if (name === 'enumValues') {
-        return (enums ?? []).map((enumName) => ({ gqlType: '__EnumValue', enumName }) as GqlSource);
-      }
-      if (name === 'possibleTypes' || name === 'interfaces' || name === 'inputFields') return [];
-      return null;
-    }
-    case '__Field':
-      if (name === 'name') return source.fieldName;
-      if (name === 'description') return null;
-      if (name === 'isDeprecated') return false;
-      if (name === 'args') return [];
-      return null;
-    case '__EnumValue':
-      if (name === 'name') return source.enumName;
-      if (name === 'description') return null;
-      if (name === 'isDeprecated') return false;
-      return null;
-    case 'CreateIssuePayload':
-    case 'CloseIssuePayload':
-      if (name === 'issue') return source.issue;
-      if (name === 'clientMutationId') return null;
-      return null;
-    case 'CreatePullRequestPayload':
-    case 'MergePullRequestPayload':
-      if (name === 'pullRequest') return source.pull;
-      if (name === 'clientMutationId') return null;
-      return null;
-    case 'AddCommentPayload':
-      if (name === 'commentEdge') return { gqlType: 'CommentEdge', node: source.comment } as GqlSource;
-      if (name === 'clientMutationId') return null;
-      if (name === 'subject') return source.comment && source.comment.gqlType === 'IssueComment' ? issueSource(source.comment.repo, source.comment.issue) : null;
-      return null;
-    case 'CommentEdge':
-      if (name === 'node') return source.node;
-      if (name === 'cursor') return cursorOf(0);
-      return null;
-    default:
-      return null;
-  }
-}
-
-function resolveGqlMutation(name: string, selection: GqlSelection, ctx: GqlCtx): GqlRaw {
-  const input = asRecord(argOf(selection, ctx, 'input'));
-  if (name === 'createIssue') {
-    const repoSourceFound = typeof input.repositoryId === 'string' ? sourceFromGlobalId(input.repositoryId) : null;
-    if (repoSourceFound === null || repoSourceFound.gqlType !== 'Repository') {
-      ctx.errors.push({ message: 'Could not resolve the repository for createIssue' });
-      return { gqlType: 'CreateIssuePayload', issue: null } as GqlSource;
-    }
-    const repo = repoSourceFound.repo;
-    const issue = createIssueRec(repo, String(input.title ?? ''), typeof input.body === 'string' ? input.body : '', []);
-    return { gqlType: 'CreateIssuePayload', issue: issueSource(repo, issue) } as GqlSource;
-  }
-  if (name === 'closeIssue') {
-    const found = typeof input.issueId === 'string' ? sourceFromGlobalId(input.issueId) : null;
-    if (found === null || found.gqlType !== 'Issue') {
-      ctx.errors.push({ message: 'Could not resolve the issue for closeIssue' });
-      return { gqlType: 'CloseIssuePayload', issue: null } as GqlSource;
-    }
-    found.issue.state = 'closed';
-    return { gqlType: 'CloseIssuePayload', issue: issueSource(found.repo, found.issue) } as GqlSource;
-  }
-  if (name === 'createPullRequest') {
-    const repoSourceFound = typeof input.repositoryId === 'string' ? sourceFromGlobalId(input.repositoryId) : null;
-    if (repoSourceFound === null || repoSourceFound.gqlType !== 'Repository') {
-      ctx.errors.push({ message: 'Could not resolve the repository for createPullRequest' });
-      return { gqlType: 'CreatePullRequestPayload', pull: null } as GqlSource;
-    }
-    const repo = repoSourceFound.repo;
-    const headRef = String(input.headRefName ?? '');
-    const baseRef = String(input.baseRefName ?? '');
-    if (refSha(repo, headRef) === null || refSha(repo, baseRef) === null) {
-      ctx.errors.push({ message: 'Head or base branch does not exist' });
-      return { gqlType: 'CreatePullRequestPayload', pull: null } as GqlSource;
-    }
-    const pull = createPullRec(repo, String(input.title ?? ''), typeof input.body === 'string' ? input.body : '', headRef, baseRef);
-    return { gqlType: 'CreatePullRequestPayload', pull: pullSource(repo, pull) } as GqlSource;
-  }
-  if (name === 'mergePullRequest') {
-    const found = typeof input.pullRequestId === 'string' ? sourceFromGlobalId(input.pullRequestId) : null;
-    if (found === null || found.gqlType !== 'PullRequest') {
-      ctx.errors.push({ message: 'Could not resolve the pull request for mergePullRequest' });
-      return { gqlType: 'MergePullRequestPayload', pull: null } as GqlSource;
-    }
-    const method = String(input.mergeMethod ?? 'SQUASH').toUpperCase();
-    const sha = performMerge(found.repo, found.pull, method === 'MERGE' ? 'merge' : 'squash');
-    if (sha === null) {
-      ctx.errors.push({ message: 'Pull request is not mergeable' });
-      return { gqlType: 'MergePullRequestPayload', pull: null } as GqlSource;
-    }
-    return { gqlType: 'MergePullRequestPayload', pull: pullSource(found.repo, found.pull) } as GqlSource;
-  }
-  if (name === 'addComment') {
-    const found = typeof input.subjectId === 'string' ? sourceFromGlobalId(input.subjectId) : null;
-    if (found === null || found.gqlType !== 'Issue') {
-      ctx.errors.push({ message: 'Could not resolve the subject for addComment' });
-      return { gqlType: 'AddCommentPayload', comment: null } as GqlSource;
-    }
-    state.dbSeq += 1;
-    const comment: CommentRec = { dbId: state.dbSeq, body: String(input.body ?? ''), seq: ++state.repoSeq };
-    found.issue.comments.push(comment);
-    return {
-      gqlType: 'AddCommentPayload',
-      comment: { gqlType: 'IssueComment', repo: found.repo, issue: found.issue, comment } as GqlSource,
-    } as GqlSource;
-  }
-  return undefined;
-}
-
-/** Execute a selection set against a typed source; returns the JSON-shaped data object. */
-function executeSelectionSet(typeName: string, source: GqlSource | null, selections: GqlSelection[], ctx: GqlCtx): Record<string, unknown> {
+function evalArgs(
+  args: { name: string; value: GqlValue }[],
+  ctx: GqlExecContext,
+): Record<string, unknown> {
   const out: Record<string, unknown> = {};
+  for (const arg of args) out[arg.name] = evalGqlValue(arg.value, ctx);
+  return out;
+}
+
+function repoByGid(store: Store, gid: string): RepoRec | null {
+  const decoded = decodeGid(gid);
+  if (!decoded || decoded.kind !== 'Repository') return null;
+  const id = Number(decoded.key);
+  for (const repo of store.repos.values()) if (repo.id === id) return repo;
+  return null;
+}
+
+function issueByGid(store: Store, gid: string): { repo: RepoRec; issue: IssueRec } | null {
+  const decoded = decodeGid(gid);
+  if (!decoded || decoded.kind !== 'Issue') return null;
+  const [repoIdRaw, numberRaw] = decoded.key.split(':');
+  for (const repo of store.repos.values()) {
+    if (repo.id === Number(repoIdRaw)) {
+      const issue = repo.issues.get(Number(numberRaw));
+      return issue ? { repo, issue } : null;
+    }
+  }
+  return null;
+}
+
+function pullByGid(store: Store, gid: string): { repo: RepoRec; pull: PullRec } | null {
+  const decoded = decodeGid(gid);
+  if (!decoded || decoded.kind !== 'PullRequest') return null;
+  const [repoIdRaw, numberRaw] = decoded.key.split(':');
+  for (const repo of store.repos.values()) {
+    if (repo.id === Number(repoIdRaw)) {
+      const pull = repo.pulls.get(Number(numberRaw));
+      return pull ? { repo, pull } : null;
+    }
+  }
+  return null;
+}
+
+function nodeByGid(store: Store, gid: string): GqlObj | null {
+  const decoded = decodeGid(gid);
+  if (!decoded) return null;
+  if (decoded.kind === 'Repository') {
+    const repo = repoByGid(store, gid);
+    return repo ? repoObj(repo) : null;
+  }
+  if (decoded.kind === 'Issue') {
+    const found = issueByGid(store, gid);
+    return found ? issueObj(found.repo, found.issue) : null;
+  }
+  if (decoded.kind === 'PullRequest') {
+    const found = pullByGid(store, gid);
+    return found ? pullObj(found.repo, found.pull) : null;
+  }
+  if (decoded.kind === 'User') return userObj(decoded.key);
+  return null;
+}
+
+function resolveField(
+  ctx: GqlExecContext,
+  typeName: string,
+  source: GqlObj,
+  field: string,
+  args: Record<string, unknown>,
+): unknown {
+  const store = ctx.store;
+
+  if (typeName === 'Query') {
+    if (field === 'viewer') return userObj(VIEWER_LOGIN);
+    if (field === 'repository') {
+      const repo = findRepo(store, String(args.owner ?? ''), String(args.name ?? ''));
+      return repo ? repoObj(repo) : null;
+    }
+    if (field === 'node') return typeof args.id === 'string' ? nodeByGid(store, args.id) : null;
+    if (field === '__type') return typeDescriptor(String(args.name ?? ''));
+    if (field === '__schema') {
+      return {
+        __typename: '__Schema',
+        queryType: typeDescriptor('Query'),
+        mutationType: typeDescriptor('Mutation'),
+      };
+    }
+    if (field === 'rateLimit') {
+      return { __typename: 'RateLimit', limit: 5000, cost: 1, remaining: 4999, used: 1, resetAt: tickIso(store) };
+    }
+    return UNKNOWN_FIELD;
+  }
+
+  if (typeName === 'Mutation') {
+    const input = (args.input ?? {}) as Record<string, unknown>;
+    if (field === 'createIssue') {
+      const repo = typeof input.repositoryId === 'string' ? repoByGid(store, input.repositoryId) : null;
+      if (!repo) throw new Error('repository not found');
+      const issue = createIssueRec(
+        store,
+        repo,
+        String(input.title ?? ''),
+        String(input.body ?? ''),
+        [],
+      );
+      return { __typename: 'CreateIssuePayload', issue: issueObj(repo, issue) };
+    }
+    if (field === 'closeIssue') {
+      const found = typeof input.issueId === 'string' ? issueByGid(store, input.issueId) : null;
+      if (!found) throw new Error('issue not found');
+      found.issue.state = 'closed';
+      return { __typename: 'CloseIssuePayload', issue: issueObj(found.repo, found.issue) };
+    }
+    if (field === 'createPullRequest') {
+      const repo = typeof input.repositoryId === 'string' ? repoByGid(store, input.repositoryId) : null;
+      if (!repo) throw new Error('repository not found');
+      const head = String(input.headRefName ?? '');
+      const base = String(input.baseRefName ?? '');
+      if (!branchTip(repo, head)) throw new Error(`head branch not found: ${head}`);
+      if (!branchTip(repo, base)) throw new Error(`base branch not found: ${base}`);
+      const pull = createPullRec(store, repo, String(input.title ?? ''), String(input.body ?? ''), head, base);
+      return { __typename: 'CreatePullRequestPayload', pullRequest: pullObj(repo, pull) };
+    }
+    if (field === 'mergePullRequest') {
+      const found = typeof input.pullRequestId === 'string' ? pullByGid(store, input.pullRequestId) : null;
+      if (!found) throw new Error('pull request not found');
+      if (found.pull.merged) throw new Error('pull request already merged');
+      const result = executeSquashMerge(store, found.repo, found.pull);
+      if (!result.ok) throw new Error('Pull Request is not mergeable');
+      return { __typename: 'MergePullRequestPayload', pullRequest: pullObj(found.repo, found.pull) };
+    }
+    if (field === 'addComment') {
+      const found = typeof input.subjectId === 'string' ? issueByGid(store, input.subjectId) : null;
+      if (!found) throw new Error('subject not found');
+      const comment: CommentRec = {
+        id: store.nextCommentId++,
+        body: String(input.body ?? ''),
+        author: VIEWER_LOGIN,
+        createdSeq: store.clockSeq + 1,
+      };
+      tickIso(store);
+      found.issue.comments.push(comment);
+      const node: GqlObj = {
+        __typename: 'Comment',
+        repo: found.repo,
+        issue: found.issue,
+        comment,
+      };
+      return {
+        __typename: 'AddCommentPayload',
+        commentEdge: { __typename: 'CommentEdge', node, cursor: encodeCursor(found.issue.comments.length) },
+        subject: node,
+      };
+    }
+    return UNKNOWN_FIELD;
+  }
+
+  if (typeName === 'User') {
+    const login = String(source.login ?? '');
+    if (field === 'login') return login;
+    if (field === 'id') return encodeGid('User', login);
+    if (field === 'name') return login === VIEWER_LOGIN ? VIEWER_NAME : login;
+    if (field === 'email') return login === VIEWER_LOGIN ? VIEWER_EMAIL : `${login}@example.invalid`;
+    if (field === 'isViewer') return login === VIEWER_LOGIN;
+    if (field === 'url' || field === 'avatarUrl') return `https://forge.invalid/${login}`;
+    return UNKNOWN_FIELD;
+  }
+
+  if (typeName === 'Repository') {
+    const repo = source.repo as RepoRec;
+    switch (field) {
+      case 'id': return encodeGid('Repository', String(repo.id));
+      case 'databaseId': return repo.id;
+      case 'name': return repo.name;
+      case 'nameWithOwner': return repoKey(repo.owner, repo.name);
+      case 'owner': return userObj(repo.owner);
+      case 'description': return repo.description;
+      case 'isPrivate': return repo.isPrivate;
+      case 'private': return repo.isPrivate;
+      case 'defaultBranchRef': return { __typename: 'Ref', repo, name: repo.defaultBranch };
+      case 'viewerPermission': return 'ADMIN';
+      case 'hasIssuesEnabled': return true;
+      case 'hasPullRequestsEnabled': return true;
+      case 'createdAt': return new Date((EPOCH_SECONDS + repo.createdSeq) * 1000).toISOString();
+      case 'updatedAt': return new Date((EPOCH_SECONDS + repo.createdSeq) * 1000).toISOString();
+      case 'url': return `https://forge.invalid/${repo.owner}/${repo.name}`;
+      case 'issue': {
+        const issue = repo.issues.get(Number(args.number));
+        return issue ? issueObj(repo, issue) : null;
+      }
+      case 'issues': {
+        let list = [...repo.issues.values()];
+        const states = Array.isArray(args.states) ? (args.states as string[]) : null;
+        if (states && states.length > 0) {
+          list = list.filter((issue) => states.includes(issue.state.toUpperCase()));
+        }
+        const orderBy = (args.orderBy ?? null) as { field?: string; direction?: string } | null;
+        if (orderBy && orderBy.field === 'CREATED_AT') {
+          const dir = orderBy.direction === 'DESC' ? -1 : 1;
+          list.sort((a, b) => dir * (a.createdSeq - b.createdSeq) || dir * (a.number - b.number));
+        } else {
+          list.sort((a, b) => a.number - b.number);
+        }
+        return connectionObj('IssueConnection', list.map((issue) => issueObj(repo, issue)), args);
+      }
+      case 'pullRequest': {
+        const pull = repo.pulls.get(Number(args.number));
+        return pull ? pullObj(repo, pull) : null;
+      }
+      case 'pullRequests': {
+        let list = [...repo.pulls.values()];
+        const states = Array.isArray(args.states) ? (args.states as string[]) : null;
+        if (states && states.length > 0) {
+          list = list.filter((pull) => {
+            const gqlState = pull.merged ? 'MERGED' : pull.state.toUpperCase();
+            return states.includes(gqlState);
+          });
+        }
+        list.sort((a, b) => a.number - b.number);
+        return connectionObj('PullRequestConnection', list.map((pull) => pullObj(repo, pull)), args);
+      }
+    }
+    return UNKNOWN_FIELD;
+  }
+
+  if (typeName === 'Issue') {
+    const repo = source.repo as RepoRec;
+    const issue = source.issue as IssueRec;
+    switch (field) {
+      case 'id': return encodeGid('Issue', `${repo.id}:${issue.number}`);
+      case 'number': return issue.number;
+      case 'title': return issue.title;
+      case 'body': return issue.body;
+      case 'state': return issue.state.toUpperCase();
+      case 'closed': return issue.state === 'closed';
+      case 'author': return userObj(VIEWER_LOGIN);
+      case 'repository': return repoObj(repo);
+      case 'createdAt': return new Date((EPOCH_SECONDS + issue.createdSeq) * 1000).toISOString();
+      case 'updatedAt': return new Date((EPOCH_SECONDS + issue.createdSeq) * 1000).toISOString();
+      case 'url': return `https://forge.invalid/${repo.owner}/${repo.name}/issues/${issue.number}`;
+      case 'labels': {
+        const nodes = issue.labels
+          .map((name) => repo.labels.get(name))
+          .filter((label): label is LabelRec => label !== undefined)
+          .map((label): GqlObj => ({ __typename: 'Label', repo, label }));
+        return connectionObj('LabelConnection', nodes, args);
+      }
+      case 'comments': {
+        const nodes = issue.comments.map(
+          (comment): GqlObj => ({ __typename: 'Comment', repo, issue, comment }),
+        );
+        return connectionObj('CommentConnection', nodes, args);
+      }
+    }
+    return UNKNOWN_FIELD;
+  }
+
+  if (typeName === 'PullRequest') {
+    const repo = source.repo as RepoRec;
+    const pull = source.pull as PullRec;
+    switch (field) {
+      case 'id': return encodeGid('PullRequest', `${repo.id}:${pull.number}`);
+      case 'number': return pull.number;
+      case 'title': return pull.title;
+      case 'body': return pull.body;
+      case 'state': return pull.merged ? 'MERGED' : pull.state.toUpperCase();
+      case 'merged': return pull.merged;
+      case 'mergedAt': return pull.mergedAt;
+      case 'mergeCommitSha': return pull.mergeCommitSha;
+      case 'closed': return pull.state === 'closed';
+      case 'headRefName': return pull.headRef;
+      case 'baseRefName': return pull.baseRef;
+      case 'author': return userObj(VIEWER_LOGIN);
+      case 'createdAt': return new Date((EPOCH_SECONDS + pull.createdSeq) * 1000).toISOString();
+      case 'updatedAt': return new Date((EPOCH_SECONDS + pull.createdSeq) * 1000).toISOString();
+      case 'url': return `https://forge.invalid/${repo.owner}/${repo.name}/pull/${pull.number}`;
+      case 'mergeable': {
+        if (pull.state !== 'open' || pull.merged) return 'UNKNOWN';
+        const baseTip = branchTip(repo, pull.baseRef);
+        const headTip = branchTip(repo, pull.headRef);
+        if (!baseTip || !headTip) return 'UNKNOWN';
+        return tryMergeTrees(repo, baseTip, headTip).conflict ? 'CONFLICTING' : 'MERGEABLE';
+      }
+      case 'files': {
+        const baseTip = branchTip(repo, pull.baseRef);
+        const headTip = branchTip(repo, pull.headRef);
+        if (!baseTip || !headTip) return connectionObj('PullRequestFileConnection', [], args);
+        const mergeBase = findMergeBase(repo, headTip, baseTip);
+        const fromTree = mergeBase ? commitTreeOid(repo, mergeBase) : '';
+        const changes = diffTrees(repo, fromTree, commitTreeOid(repo, headTip));
+        const nodes = changes.map(
+          (change): GqlObj => ({
+            __typename: 'PullRequestFile',
+            path: change.filename,
+            additions: change.additions,
+            deletions: change.deletions,
+          }),
+        );
+        return connectionObj('PullRequestFileConnection', nodes, args);
+      }
+      case 'changedFiles': {
+        const baseTip = branchTip(repo, pull.baseRef);
+        const headTip = branchTip(repo, pull.headRef);
+        if (!baseTip || !headTip) return 0;
+        const mergeBase = findMergeBase(repo, headTip, baseTip);
+        const fromTree = mergeBase ? commitTreeOid(repo, mergeBase) : '';
+        return diffTrees(repo, fromTree, commitTreeOid(repo, headTip)).length;
+      }
+      case 'headRef': return { __typename: 'Ref', repo, name: pull.headRef };
+      case 'baseRef': return { __typename: 'Ref', repo, name: pull.baseRef };
+    }
+    return UNKNOWN_FIELD;
+  }
+
+  if (typeName === 'Ref') {
+    const repo = source.repo as RepoRec;
+    if (field === 'name') return String(source.name ?? '');
+    if (field === 'prefix') return 'refs/heads/';
+    if (field === 'target') {
+      const tip = branchTip(repo, String(source.name ?? ''));
+      return tip ? { __typename: 'Commit', repo, oid: tip } : null;
+    }
+    return UNKNOWN_FIELD;
+  }
+
+  if (typeName === 'Commit') {
+    const repo = source.repo as RepoRec;
+    const oid = String(source.oid ?? '');
+    if (field === 'oid') return oid;
+    const object = getObject(repo, oid);
+    if (field === 'message') return object && object.type === 'commit' ? parseCommit(object.data).message : '';
+    if (field === 'committedDate') {
+      if (object && object.type === 'commit') return parseIdent(parseCommit(object.data).committer).date;
+      return new Date(EPOCH_SECONDS * 1000).toISOString();
+    }
+    return UNKNOWN_FIELD;
+  }
+
+  if (typeName === 'Label') {
+    const repo = source.repo as RepoRec;
+    const label = source.label as LabelRec;
+    if (field === 'id') return encodeGid('Label', `${repo.id}:${label.name}`);
+    if (field === 'name') return label.name;
+    if (field === 'color') return label.color;
+    return UNKNOWN_FIELD;
+  }
+
+  if (typeName === 'Comment') {
+    const repo = source.repo as RepoRec;
+    const issue = source.issue as IssueRec;
+    const comment = source.comment as CommentRec;
+    if (field === 'id') return encodeGid('Comment', `${repo.id}:${issue.number}:${comment.id}`);
+    if (field === 'body') return comment.body;
+    if (field === 'author') return userObj(comment.author);
+    if (field === 'createdAt' || field === 'updatedAt') {
+      return new Date((EPOCH_SECONDS + comment.createdSeq) * 1000).toISOString();
+    }
+    return UNKNOWN_FIELD;
+  }
+
+  // Generic fallback: plain properties on the source object.
+  if (Object.prototype.hasOwnProperty.call(source, field)) {
+    return source[field];
+  }
+  return UNKNOWN_FIELD;
+}
+
+function completeValue(
+  ctx: GqlExecContext,
+  value: unknown,
+  selection: GqlSelection[] | undefined,
+): unknown {
+  if (value === null || value === undefined) return null;
+  if (Array.isArray(value)) return value.map((item) => completeValue(ctx, item, selection));
+  if (typeof value === 'object') {
+    const obj = value as GqlObj;
+    if (typeof obj.__typename === 'string' && selection) {
+      const out: Record<string, unknown> = {};
+      executeSelectionSet(ctx, obj.__typename, obj, selection, out);
+      return out;
+    }
+    return value;
+  }
+  return value;
+}
+
+function executeSelectionSet(
+  ctx: GqlExecContext,
+  typeName: string,
+  source: GqlObj,
+  selections: GqlSelection[],
+  out: Record<string, unknown>,
+): void {
   for (const selection of selections) {
-    if (selection.inlineOn !== null) {
-      if (source !== null && (source.gqlType === selection.inlineOn || selection.inlineOn === 'Node')) {
-        Object.assign(out, executeSelectionSet(source.gqlType, source, selection.selectionSet ?? [], ctx));
+    if (selection.kind === 'fragment') {
+      if (!selection.typeCondition || selection.typeCondition === typeName) {
+        executeSelectionSet(ctx, typeName, source, selection.selection, out);
       }
       continue;
     }
-    if (selection.fragmentSpread !== null) {
-      const fragment = ctx.fragments.get(selection.fragmentSpread);
-      if (fragment !== undefined && source !== null && (source.gqlType === fragment.on || fragment.on === 'Node')) {
-        Object.assign(out, executeSelectionSet(source.gqlType, source, fragment.selectionSet, ctx));
+    if (selection.kind === 'spread') {
+      const fragment = ctx.fragments.get(selection.name);
+      if (fragment && (!fragment.typeCondition || fragment.typeCondition === typeName)) {
+        executeSelectionSet(ctx, typeName, source, fragment.selection, out);
       }
       continue;
     }
     const key = selection.alias ?? selection.name;
-    const knownFields = SCHEMA_FIELDS[typeName];
-    if (selection.name !== '__typename' && knownFields !== undefined && !knownFields.includes(selection.name)) {
-      ctx.errors.push({ message: `Field '${selection.name}' doesn't exist on type '${typeName}'` });
+    if (selection.name === '__typename') {
+      out[key] = typeName;
+      continue;
+    }
+    if (selection.name === 'clientMutationId') {
       out[key] = null;
       continue;
     }
-    const raw = resolveGqlField(typeName, source, selection, ctx);
-    if (raw === undefined) {
-      ctx.errors.push({ message: `Field '${selection.name}' doesn't exist on type '${typeName}'` });
+    const args = evalArgs(selection.args, ctx);
+    let value: unknown;
+    try {
+      value = resolveField(ctx, typeName, source, selection.name, args);
+    } catch (error) {
+      ctx.errors.push({ message: error instanceof Error ? error.message : String(error) });
       out[key] = null;
       continue;
     }
-    out[key] = completeGqlValue(raw, selection, ctx);
-  }
-  return out;
-}
-
-function completeGqlValue(raw: GqlRaw, selection: GqlSelection, ctx: GqlCtx): unknown {
-  if (raw === null || raw === undefined) return null;
-  if (Array.isArray(raw)) return raw.map((entry) => completeGqlValue(entry, selection, ctx));
-  if (typeof raw === 'object' && raw !== null && 'gqlType' in raw) {
-    const source = raw as GqlSource;
-    if (selection.selectionSet === null) return sourceId(source);
-    return executeSelectionSet(source.gqlType, source, selection.selectionSet, ctx);
-  }
-  if (typeof raw === 'object') {
-    // A plain value object (pageInfo): project the requested subfields.
-    if (selection.selectionSet === null) return raw;
-    const record = raw as Record<string, unknown>;
-    const out: Record<string, unknown> = {};
-    for (const sub of selection.selectionSet) {
-      out[sub.alias ?? sub.name] = completeGqlValue(record[sub.name] ?? null, sub, ctx);
+    if (value === UNKNOWN_FIELD) {
+      ctx.errors.push({
+        message: `Field '${selection.name}' doesn't exist on type '${typeName}'`,
+      });
+      out[key] = null;
+      continue;
     }
-    return out;
+    out[key] = completeValue(ctx, value, selection.selection);
   }
-  return raw;
 }
 
-function executeGqlOperation(operation: GqlOperation, doc: GqlDocument, variables: Record<string, unknown>): Record<string, unknown> {
-  const ctx: GqlCtx = { variables, fragments: doc.fragments, errors: [] };
-  const rootType = operation.type === 'mutation' ? 'Mutation' : 'Query';
-  const data = executeSelectionSet(rootType, null, operation.selectionSet, ctx);
+function executeGraphqlOperation(
+  store: Store,
+  item: { query?: unknown; variables?: unknown; operationName?: unknown },
+): Record<string, unknown> {
+  if (typeof item.query !== 'string') {
+    return { errors: [{ message: 'query must be a string' }] };
+  }
+  let document: GqlDocument;
+  try {
+    document = new GqlParser(item.query).parseDocument();
+  } catch (error) {
+    return { errors: [{ message: error instanceof Error ? error.message : 'parse error' }] };
+  }
+  let operation: GqlOperation | undefined;
+  if (typeof item.operationName === 'string') {
+    operation = document.operations.find((candidate) => candidate.name === item.operationName);
+  }
+  if (!operation) operation = document.operations[0];
+  if (!operation) return { errors: [{ message: 'no operation in document' }] };
+
+  const variables: Record<string, unknown> = {};
+  for (const [name, defaultValue] of operation.variableDefaults) {
+    const probe: GqlExecContext = { store, variables: {}, fragments: document.fragments, errors: [] };
+    variables[name] = evalGqlValue(defaultValue, probe);
+  }
+  if (item.variables && typeof item.variables === 'object' && !Array.isArray(item.variables)) {
+    Object.assign(variables, item.variables as Record<string, unknown>);
+  }
+  const ctx: GqlExecContext = { store, variables, fragments: document.fragments, errors: [] };
+  const rootType = operation.operation === 'mutation' ? 'Mutation' : 'Query';
+  const data: Record<string, unknown> = {};
+  executeSelectionSet(ctx, rootType, { __typename: rootType }, operation.selection, data);
   const result: Record<string, unknown> = { data };
-  if (ctx.errors.length > 0) result.errors = ctx.errors.map((error) => ({ message: error.message, type: 'VALIDATION' }));
+  if (ctx.errors.length > 0) result.errors = ctx.errors;
   return result;
 }
 
-function handleGraphql(info: ReqInfo, res: ServerResponse): void {
-  if (info.method !== 'POST') {
-    sendJson(res, 404, { message: 'Not Found' });
-    return;
-  }
-  if (!authed(info)) {
-    sendJson(res, 401, { message: 'Requires authentication' });
+function handleGraphQL(store: Store, req: IncomingMessage, res: ServerResponse, body: Buffer): void {
+  if (!isAuthed(req)) {
+    sendJson(store, res, 401, { message: 'Bad credentials' });
     return;
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(info.body.toString('utf8'));
+    parsed = JSON.parse(body.toString('utf8'));
   } catch {
-    sendJson(res, 400, { errors: [{ message: 'Problems parsing JSON' }] });
+    sendJson(store, res, 400, { errors: [{ message: 'Malformed JSON' }] });
     return;
   }
-  const runOne = (entry: unknown): Record<string, unknown> => {
-    const record = asRecord(entry);
-    const query = strField(record, 'query');
-    if (query === undefined) return { errors: [{ message: 'No query string supplied' }] };
-    const variables = asRecord(record.variables);
-    let doc: GqlDocument;
-    try {
-      doc = new GqlParser(query).parseDocument();
-    } catch (err) {
-      return { errors: [{ message: err instanceof Error ? err.message : 'Could not parse the query' }] };
-    }
-    if (doc.operations.length === 0) return { errors: [{ message: 'No operation found in the document' }] };
-    const operationName = strField(record, 'operationName');
-    const operation = (operationName !== undefined ? doc.operations.find((op) => op.name === operationName) : undefined) ?? doc.operations[0] as GqlOperation;
-    return executeGqlOperation(operation, doc, variables);
-  };
   if (Array.isArray(parsed)) {
-    sendJson(res, 200, parsed.map((entry) => runOne(entry)));
+    const results = parsed.map((item) =>
+      executeGraphqlOperation(store, (item ?? {}) as { query?: unknown }),
+    );
+    sendJson(store, res, 200, results);
     return;
   }
-  sendJson(res, 200, runOne(parsed));
+  if (parsed && typeof parsed === 'object') {
+    sendJson(store, res, 200, executeGraphqlOperation(store, parsed as { query?: unknown }));
+    return;
+  }
+  sendJson(store, res, 400, { errors: [{ message: 'Malformed request' }] });
 }
 
 // ---------------------------------------------------------------------------
-// MCP (streamable HTTP, JSON-RPC 2.0)
+// MCP endpoint: JSON-RPC 2.0 over POST /mcp. Speaks the modern
+// server/discover handshake and the legacy initialize handshake, and exposes
+// six repository tools backed by the same store as REST.
+// ---------------------------------------------------------------------------
 
-const MCP_SERVER_INFO = { name: 'forge-mcp', version: '1.0.0' };
-const MCP_SUPPORTED_VERSIONS = ['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26'];
+const MCP_SERVER_INFO = { name: 'forge-mcp', version: FORGE_VERSION };
+const MCP_SUPPORTED_VERSIONS = ['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
+const MCP_LEGACY_VERSIONS = ['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25'];
 
-interface McpToolDef {
-  name: string;
-  description: string;
-  properties: Record<string, { type: string; description: string }>;
-  required: string[];
-}
-
-const MCP_TOOL_DEFS: McpToolDef[] = [
+const MCP_TOOLS = [
   {
     name: 'create_repo',
-    description: 'Create a new repository for the authenticated user.',
-    properties: {
-      name: { type: 'string', description: 'The repository name.' },
-      description: { type: 'string', description: 'A short description of the repository.' },
-      private: { type: 'boolean', description: 'Whether the repository is private.' },
+    description: 'Create a new repository owned by the authenticated user.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Repository name.' },
+        description: { type: 'string', description: 'Repository description.' },
+        private: { type: 'boolean', description: 'Whether the repository is private.' },
+      },
+      required: ['name'],
     },
-    required: ['name'],
   },
   {
     name: 'get_repo',
-    description: 'Get a repository by owner and name.',
-    properties: {
-      owner: { type: 'string', description: 'The repository owner login.' },
-      repo: { type: 'string', description: 'The repository name.' },
+    description: 'Fetch a repository by owner and name.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        owner: { type: 'string', description: 'Repository owner login.' },
+        repo: { type: 'string', description: 'Repository name.' },
+      },
+      required: ['owner', 'repo'],
     },
-    required: ['owner', 'repo'],
   },
   {
     name: 'create_issue',
-    description: 'Create an issue in a repository.',
-    properties: {
-      owner: { type: 'string', description: 'The repository owner login.' },
-      repo: { type: 'string', description: 'The repository name.' },
-      title: { type: 'string', description: 'The issue title.' },
-      body: { type: 'string', description: 'The issue body.' },
+    description: 'Open a new issue in a repository.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        owner: { type: 'string', description: 'Repository owner login.' },
+        repo: { type: 'string', description: 'Repository name.' },
+        title: { type: 'string', description: 'Issue title.' },
+        body: { type: 'string', description: 'Issue body.' },
+      },
+      required: ['owner', 'repo', 'title'],
     },
-    required: ['owner', 'repo', 'title'],
   },
   {
     name: 'list_issues',
-    description: 'List the issues of a repository, optionally filtered by state.',
-    properties: {
-      owner: { type: 'string', description: 'The repository owner login.' },
-      repo: { type: 'string', description: 'The repository name.' },
-      state: { type: 'string', description: 'Filter by state: open, closed or all.' },
+    description: 'List issues in a repository, optionally filtered by state.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        owner: { type: 'string', description: 'Repository owner login.' },
+        repo: { type: 'string', description: 'Repository name.' },
+        state: { type: 'string', description: 'Issue state filter: open, closed or all.' },
+      },
+      required: ['owner', 'repo'],
     },
-    required: ['owner', 'repo'],
   },
   {
     name: 'create_pull_request',
     description: 'Open a pull request from a head branch into a base branch.',
-    properties: {
-      owner: { type: 'string', description: 'The repository owner login.' },
-      repo: { type: 'string', description: 'The repository name.' },
-      title: { type: 'string', description: 'The pull request title.' },
-      body: { type: 'string', description: 'The pull request body.' },
-      head: { type: 'string', description: 'The head branch name.' },
-      base: { type: 'string', description: 'The base branch name.' },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        owner: { type: 'string', description: 'Repository owner login.' },
+        repo: { type: 'string', description: 'Repository name.' },
+        title: { type: 'string', description: 'Pull request title.' },
+        body: { type: 'string', description: 'Pull request body.' },
+        head: { type: 'string', description: 'Head branch name.' },
+        base: { type: 'string', description: 'Base branch name.' },
+      },
+      required: ['owner', 'repo', 'title', 'head', 'base'],
     },
-    required: ['owner', 'repo', 'title', 'head', 'base'],
   },
   {
     name: 'merge_pull_request',
-    description: 'Merge a pull request by number (squash).',
-    properties: {
-      owner: { type: 'string', description: 'The repository owner login.' },
-      repo: { type: 'string', description: 'The repository name.' },
-      pull_number: { type: 'number', description: 'The pull request number.' },
+    description: 'Merge a pull request into its base branch (squash).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        owner: { type: 'string', description: 'Repository owner login.' },
+        repo: { type: 'string', description: 'Repository name.' },
+        pull_number: { type: 'number', description: 'Pull request number.' },
+      },
+      required: ['owner', 'repo', 'pull_number'],
     },
-    required: ['owner', 'repo', 'pull_number'],
   },
 ];
 
-/** The tools/list payload, built once so repeated calls are byte-identical. */
-const MCP_TOOLS_JSON: unknown = MCP_TOOL_DEFS.map((def) => ({
-  name: def.name,
-  description: def.description,
-  inputSchema: {
-    type: 'object',
-    properties: def.properties,
-    required: def.required,
-    additionalProperties: false,
-  },
-}));
+class RpcError extends Error {
+  code: number;
+  constructor(code: number, message: string) {
+    super(message);
+    this.code = code;
+  }
+}
 
-function mcpToolResult(value: unknown): Record<string, unknown> {
-  return {
-    content: [{ type: 'text', text: JSON.stringify(value) }],
-    structuredContent: value as Record<string, unknown>,
+function mcpToolOk(value: unknown, textOverride?: string): Record<string, unknown> {
+  const text = textOverride ?? JSON.stringify(value);
+  const result: Record<string, unknown> = {
+    content: [{ type: 'text', text }],
     isError: false,
   };
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    result.structuredContent = value;
+  }
+  return result;
 }
 
 function mcpToolError(message: string): Record<string, unknown> {
   return { content: [{ type: 'text', text: message }], isError: true };
 }
 
-/** Run one MCP tool against the shared store; a string return is an error message. */
-function runMcpTool(name: string, args: Record<string, unknown>): Record<string, unknown> {
-  const def = MCP_TOOL_DEFS.find((candidate) => candidate.name === name);
-  if (def === undefined) return { rpcError: -32601, message: `Method not found: unknown tool ${name}` };
-  const missing = def.required.filter((key) => args[key] === undefined || args[key] === null || args[key] === '');
-  if (missing.length > 0) {
-    return { rpcError: -32602, message: `Missing required argument(s): ${missing.join(', ')}` };
+function mcpCallTool(store: Store, params: Record<string, unknown>): Record<string, unknown> {
+  const name = typeof params.name === 'string' ? params.name : '';
+  const args = (params.arguments ?? {}) as Record<string, unknown>;
+  const tool = MCP_TOOLS.find((candidate) => candidate.name === name);
+  if (!tool) throw new RpcError(-32602, `Unknown tool: ${name}`);
+  for (const required of tool.inputSchema.required) {
+    if (args[required] === undefined || args[required] === '') {
+      throw new RpcError(-32602, `Missing required argument: ${required}`);
+    }
   }
-  const owner = String(args.owner ?? viewerLogin());
-  const repoName = String(args.repo ?? '');
-  const needRepo = (): RepoRec | null => (name === 'create_repo' ? null : findRepo(owner, repoName));
+  const repoFor = (): RepoRec | undefined =>
+    findRepo(store, String(args.owner ?? ''), String(args.repo ?? ''));
+
   switch (name) {
     case 'create_repo': {
-      const repoArg = String(args.name ?? '');
-      if (repoArg === '') return mcpToolError('name is required');
-      if (state.repos.has(repoArg.toLowerCase())) return mcpToolError(`Repository ${repoArg} already exists`);
-      const repo = createRepo(repoArg, typeof args.description === 'string' ? args.description : null, args.private === true);
-      return mcpToolResult(repoJson(repo));
+      const repoName = String(args.name);
+      const existing = findRepo(store, VIEWER_LOGIN, repoName);
+      if (existing) return mcpToolOk(repoJson(existing));
+      const repo = createRepoRec(
+        store,
+        VIEWER_LOGIN,
+        repoName,
+        typeof args.description === 'string' ? args.description : '',
+        args.private === true,
+      );
+      return mcpToolOk(repoJson(repo));
     }
     case 'get_repo': {
-      const repo = needRepo();
-      if (repo === null) return mcpToolError(`Repository ${owner}/${repoName} not found`);
-      return mcpToolResult(repoJson(repo));
+      const repo = repoFor();
+      if (!repo) return mcpToolError(`Repository not found: ${String(args.owner)}/${String(args.repo)}`);
+      return mcpToolOk(repoJson(repo));
     }
     case 'create_issue': {
-      const repo = needRepo();
-      if (repo === null) return mcpToolError(`Repository ${owner}/${repoName} not found`);
-      const issue = createIssueRec(repo, String(args.title ?? ''), typeof args.body === 'string' ? args.body : '', []);
-      return mcpToolResult(issueJson(repo, issue));
+      const repo = repoFor();
+      if (!repo) return mcpToolError('Repository not found');
+      const issue = createIssueRec(
+        store,
+        repo,
+        String(args.title),
+        typeof args.body === 'string' ? args.body : '',
+        [],
+      );
+      return mcpToolOk(issueJson(repo, issue));
     }
     case 'list_issues': {
-      const repo = needRepo();
-      if (repo === null) return mcpToolError(`Repository ${owner}/${repoName} not found`);
-      const wanted = typeof args.state === 'string' ? args.state.toLowerCase() : 'open';
-      let issues = [...repo.issues.values()];
-      if (wanted === 'open') issues = issues.filter((issue) => issue.state === 'open');
-      else if (wanted === 'closed') issues = issues.filter((issue) => issue.state === 'closed');
-      issues.sort((a, b) => b.number - a.number);
-      return mcpToolResult(issues.map((issue) => issueJson(repo, issue)));
+      const repo = repoFor();
+      if (!repo) return mcpToolError('Repository not found');
+      const state = typeof args.state === 'string' ? args.state : 'open';
+      let list = [...repo.issues.values()];
+      if (state === 'open' || state === 'closed') {
+        list = list.filter((issue) => issue.state === state);
+      }
+      list.sort((a, b) => a.number - b.number);
+      const issues = list.map((issue) => issueJson(repo, issue));
+      return mcpToolOk({ issues }, JSON.stringify(issues));
     }
     case 'create_pull_request': {
-      const repo = needRepo();
-      if (repo === null) return mcpToolError(`Repository ${owner}/${repoName} not found`);
-      const head = String(args.head ?? '');
-      const base = String(args.base ?? '');
-      if (refSha(repo, head) === null) return mcpToolError(`Head branch ${head} does not exist`);
-      if (refSha(repo, base) === null) return mcpToolError(`Base branch ${base} does not exist`);
-      const pull = createPullRec(repo, String(args.title ?? ''), typeof args.body === 'string' ? args.body : '', head, base);
-      return mcpToolResult(pullJson(repo, pull));
+      const repo = repoFor();
+      if (!repo) return mcpToolError('Repository not found');
+      const head = stripOwnerPrefix(String(args.head));
+      const base = stripOwnerPrefix(String(args.base));
+      if (!branchTip(repo, head)) return mcpToolError(`head branch not found: ${head}`);
+      if (!branchTip(repo, base)) return mcpToolError(`base branch not found: ${base}`);
+      const duplicate = [...repo.pulls.values()].find(
+        (pull) => pull.state === 'open' && pull.headRef === head && pull.baseRef === base,
+      );
+      if (duplicate) return mcpToolOk(pullJson(repo, duplicate));
+      const pull = createPullRec(
+        store,
+        repo,
+        String(args.title),
+        typeof args.body === 'string' ? args.body : '',
+        head,
+        base,
+      );
+      return mcpToolOk(pullJson(repo, pull));
     }
     case 'merge_pull_request': {
-      const repo = needRepo();
-      if (repo === null) return mcpToolError(`Repository ${owner}/${repoName} not found`);
+      const repo = repoFor();
+      if (!repo) return mcpToolError('Repository not found');
       const pull = repo.pulls.get(Number(args.pull_number));
-      if (pull === undefined) return mcpToolError(`Pull request ${String(args.pull_number)} not found`);
-      if (pull.merged) return mcpToolResult(pullJson(repo, pull));
-      const sha = performMerge(repo, pull, 'squash');
-      if (sha === null) return mcpToolError('Pull request is not mergeable: it has conflicts');
-      return mcpToolResult(pullJson(repo, pull));
+      if (!pull) return mcpToolError(`Pull request not found: ${String(args.pull_number)}`);
+      if (pull.merged) return mcpToolOk(pullJson(repo, pull));
+      if (pull.state === 'closed') return mcpToolError('Pull Request is not mergeable');
+      const result = executeSquashMerge(store, repo, pull);
+      if (!result.ok) return mcpToolError('Pull Request is not mergeable');
+      return mcpToolOk(pullJson(repo, pull));
     }
-    default:
-      return { rpcError: -32601, message: `Method not found: unknown tool ${name}` };
+  }
+  throw new RpcError(-32602, `Unknown tool: ${name}`);
+}
+
+function mcpHandleOne(store: Store, message: unknown): Record<string, unknown> | null {
+  if (!message || typeof message !== 'object' || Array.isArray(message)) {
+    return { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid Request' } };
+  }
+  const msg = message as Record<string, unknown>;
+  const hasId = Object.prototype.hasOwnProperty.call(msg, 'id');
+  const id = hasId ? msg.id : null;
+  const method = typeof msg.method === 'string' ? msg.method : '';
+  if (!hasId) return null; // notification: nothing to answer
+  const params = (msg.params ?? {}) as Record<string, unknown>;
+  try {
+    switch (method) {
+      case 'server/discover':
+        return {
+          jsonrpc: '2.0',
+          id,
+          result: {
+            supportedVersions: MCP_SUPPORTED_VERSIONS,
+            capabilities: { tools: {} },
+            serverInfo: MCP_SERVER_INFO,
+            _meta: { 'io.modelcontextprotocol/serverInfo': MCP_SERVER_INFO },
+          },
+        };
+      case 'initialize': {
+        const requested = typeof params.protocolVersion === 'string' ? params.protocolVersion : '';
+        const protocolVersion = MCP_LEGACY_VERSIONS.includes(requested) ? requested : '2025-11-25';
+        return {
+          jsonrpc: '2.0',
+          id,
+          result: {
+            protocolVersion,
+            capabilities: { tools: {} },
+            serverInfo: MCP_SERVER_INFO,
+          },
+        };
+      }
+      case 'ping':
+        return { jsonrpc: '2.0', id, result: {} };
+      case 'tools/list':
+        return { jsonrpc: '2.0', id, result: { tools: MCP_TOOLS } };
+      case 'tools/call':
+        return { jsonrpc: '2.0', id, result: mcpCallTool(store, params) };
+      default:
+        return { jsonrpc: '2.0', id, error: { code: -32601, message: `Method not found: ${method}` } };
+    }
+  } catch (error) {
+    if (error instanceof RpcError) {
+      return { jsonrpc: '2.0', id, error: { code: error.code, message: error.message } };
+    }
+    return {
+      jsonrpc: '2.0',
+      id,
+      error: { code: -32603, message: error instanceof Error ? error.message : 'Internal error' },
+    };
   }
 }
 
-function handleMcp(info: ReqInfo, res: ServerResponse): void {
-  if (info.method !== 'POST') {
-    sendJson(res, 404, { message: 'Not Found' });
-    return;
-  }
-  if (!authed(info)) {
-    res.writeHead(401, { 'content-type': JSON_TYPE });
-    res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32001, message: 'Unauthorized' } }));
-    return;
-  }
+function handleMcp(store: Store, req: IncomingMessage, res: ServerResponse, text: string): void {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(info.body.toString('utf8'));
+    parsed = JSON.parse(text);
   } catch {
-    res.writeHead(400, { 'content-type': JSON_TYPE });
-    res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }));
+    sendBuffer(
+      res,
+      400,
+      utf8(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } })),
+      'application/json; charset=utf-8',
+    );
     return;
   }
-  const entries = Array.isArray(parsed) ? parsed : [parsed];
-  const responses: Array<Record<string, unknown>> = [];
-  let sawNotificationOnly = entries.length > 0;
-  for (const entry of entries) {
-    const record = asRecord(entry);
-    const method = typeof record.method === 'string' ? record.method : '';
-    const id = 'id' in record ? record.id : undefined;
-    if (id === undefined || method.startsWith('notifications/')) continue;
-    sawNotificationOnly = false;
-    const params = asRecord(record.params);
-    const rpc = (result: unknown): Record<string, unknown> => ({ jsonrpc: '2.0', id: id ?? null, result });
-    const rpcErr = (code: number, message: string): Record<string, unknown> => ({
-      jsonrpc: '2.0',
-      id: id ?? null,
-      error: { code, message },
-    });
-    if (method === 'server/discover') {
-      responses.push(
-        rpc({
-          resultType: 'complete',
-          supportedVersions: MCP_SUPPORTED_VERSIONS,
-          capabilities: { tools: {} },
-          serverInfo: MCP_SERVER_INFO,
-          _meta: { 'io.modelcontextprotocol/serverInfo': MCP_SERVER_INFO },
-        }),
-      );
-    } else if (method === 'initialize') {
-      const requested = typeof params.protocolVersion === 'string' ? params.protocolVersion : MCP_SUPPORTED_VERSIONS[1];
-      const chosen = (MCP_SUPPORTED_VERSIONS as string[]).includes(requested as string) ? requested : MCP_SUPPORTED_VERSIONS[1];
-      responses.push(
-        rpc({
-          protocolVersion: chosen,
-          capabilities: { tools: {} },
-          serverInfo: MCP_SERVER_INFO,
-          _meta: { 'io.modelcontextprotocol/serverInfo': MCP_SERVER_INFO },
-        }),
-      );
-    } else if (method === 'tools/list') {
-      responses.push(rpc({ tools: MCP_TOOLS_JSON }));
-    } else if (method === 'tools/call') {
-      const toolName = typeof params.name === 'string' ? params.name : '';
-      const args = asRecord(params.arguments);
-      const outcome = runMcpTool(toolName, args);
-      if (typeof outcome.rpcError === 'number') {
-        responses.push(rpcErr(outcome.rpcError, String(outcome.message ?? 'Error')));
-      } else {
-        responses.push(rpc(outcome));
-      }
-    } else if (method === 'ping') {
-      responses.push(rpc({}));
-    } else {
-      responses.push(rpcErr(-32601, `Method not found: ${method}`));
-    }
-  }
-  if (sawNotificationOnly) {
-    res.writeHead(202, { 'content-type': JSON_TYPE });
-    res.end('');
+  if (!isAuthed(req)) {
+    sendBuffer(
+      res,
+      401,
+      utf8(JSON.stringify({
+        jsonrpc: '2.0',
+        id: null,
+        error: { code: -32001, message: 'Unauthorized' },
+      })),
+      'application/json; charset=utf-8',
+    );
     return;
   }
-  const payload = Array.isArray(parsed) ? responses : responses[0] ?? { jsonrpc: '2.0', id: null, result: {} };
-  res.writeHead(200, { 'content-type': JSON_TYPE });
-  res.end(JSON.stringify(payload));
+  if (Array.isArray(parsed)) {
+    const responses = parsed
+      .map((item) => mcpHandleOne(store, item))
+      .filter((item): item is Record<string, unknown> => item !== null);
+    sendBuffer(res, 200, utf8(JSON.stringify(responses)), 'application/json; charset=utf-8');
+    return;
+  }
+  const response = mcpHandleOne(store, parsed);
+  if (response === null) {
+    res.writeHead(202);
+    res.end();
+    return;
+  }
+  sendBuffer(res, 200, utf8(JSON.stringify(response)), 'application/json; charset=utf-8');
 }
 
 // ---------------------------------------------------------------------------
-// the server
+// Top-level dispatch + createApp.
+// ---------------------------------------------------------------------------
 
-/** Read a request body with a generous cap (bench packs and issue bodies stay well under it). */
-function readBody(req: IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let total = 0;
-    req.on('data', (chunk: Buffer) => {
-      total += chunk.length;
-      if (total > 512 * 1024 * 1024) {
-        reject(new Error('request body too large'));
+const MAX_BODY_BYTES = 128 * 1024 * 1024;
+
+async function handleRequest(store: Store, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const method = (req.method ?? 'GET').toUpperCase();
+  let url: URL;
+  try {
+    url = new URL(req.url ?? '/', 'http://localhost');
+  } catch {
+    sendError(store, res, 400, 'Bad request target');
+    return;
+  }
+  const path = url.pathname;
+
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of req) {
+    const buffer = chunk as Buffer;
+    total += buffer.length;
+    if (total > MAX_BODY_BYTES) {
+      sendError(store, res, 413, 'Request body too large');
+      return;
+    }
+    chunks.push(buffer);
+  }
+  const body = Buffer.concat(chunks);
+  const ctx: RequestContext = { store, req, url, body, jsonCache: { parsed: false, value: undefined } };
+
+  if (path === '/healthz') {
+    sendJson(store, res, 200, { ok: true });
+    return;
+  }
+
+  if (path === '/mcp') {
+    if (method !== 'POST') {
+      sendError(store, res, 405, 'Method Not Allowed');
+      return;
+    }
+    handleMcp(store, req, res, body.toString('utf8'));
+    return;
+  }
+
+  if (path === '/api/graphql') {
+    if (method !== 'POST') {
+      sendError(store, res, 404, 'Not Found');
+      return;
+    }
+    handleGraphQL(store, req, res, body);
+    return;
+  }
+
+  if (path === '/api/v3' || path.startsWith('/api/v3/')) {
+    if (!isAuthed(req)) {
+      sendError(store, res, 401, 'Bad credentials');
+      return;
+    }
+    const rawSegments = path
+      .slice('/api/v3'.length)
+      .split('/')
+      .filter((segment) => segment !== '');
+    let segments: string[];
+    try {
+      segments = rawSegments.map((segment) => decodeURIComponent(segment));
+    } catch {
+      segments = rawSegments;
+    }
+    routeRest(ctx, res, segments);
+    return;
+  }
+
+  const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
+  if (gitMatch) {
+    if (!isAuthed(req)) {
+      sendError(store, res, 401, 'Bad credentials');
+      return;
+    }
+    let owner = gitMatch[1];
+    let name = gitMatch[2];
+    try {
+      owner = decodeURIComponent(owner);
+      name = decodeURIComponent(name);
+    } catch {
+      // keep raw values
+    }
+    const repo = findRepo(store, owner, name);
+    if (!repo) {
+      sendError(store, res, 404, 'Not Found');
+      return;
+    }
+    const tail = gitMatch[3];
+    if (tail === 'info/refs') {
+      if (method !== 'GET') {
+        sendError(store, res, 405, 'Method Not Allowed');
         return;
       }
-      chunks.push(chunk);
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
+      handleInfoRefs(store, req, res, repo, url.searchParams.get('service') ?? '');
+      return;
+    }
+    if (method !== 'POST') {
+      sendError(store, res, 405, 'Method Not Allowed');
+      return;
+    }
+    if (tail === 'git-upload-pack') handleUploadPack(store, req, res, repo, body);
+    else handleReceivePack(store, req, res, repo, body);
+    return;
+  }
+
+  sendError(store, res, 404, 'Not Found');
 }
 
-/** Build the forge server. It binds nothing until the caller listens. */
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    void (async () => {
+  const store = createStore();
+  const server = createServer((req, res) => {
+    handleRequest(store, req, res).catch(() => {
       try {
-        const url = new URL(req.url ?? '/', 'http://forge.local');
-        const segments = url.pathname
-          .split('/')
-          .filter((segment) => segment !== '')
-          .map((segment) => decodeURIComponent(segment));
-        const body = await readBody(req);
-        const info: ReqInfo = {
-          method: (req.method ?? 'GET').toUpperCase(),
-          segments,
-          query: url.searchParams,
-          headers: req.headers,
-          body,
-          host: req.headers.host ?? 'forge.local',
-        };
-        if (info.method === 'GET' && url.pathname === '/healthz') {
-          sendJson(res, 200, { ok: true });
-          return;
-        }
-        if (segments[0] === 'api' && segments[1] === 'v3') {
-          handleRest(info, res);
-          return;
-        }
-        if (segments[0] === 'api' && segments[1] === 'graphql') {
-          handleGraphql(info, res);
-          return;
-        }
-        if (segments[0] === 'mcp') {
-          handleMcp(info, res);
-          return;
-        }
-        if (segments.length >= 2 && (segments[1] as string).endsWith('.git')) {
-          handleGit(info, res);
-          return;
-        }
-        notFound(res);
-      } catch {
-        if (!res.headersSent) sendJson(res, 500, { message: 'Internal Server Error' });
+        if (!res.headersSent) sendError(store, res, 500, 'Internal Server Error');
         else res.end();
+      } catch {
+        // socket already gone
       }
-    })();
+    });
   });
+  return server;
 }
